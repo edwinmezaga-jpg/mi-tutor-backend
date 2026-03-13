@@ -1,9 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-// CAMBIO AQUÍ: Quitamos las llaves { } para que funcione correctamente
-import YoutubeTranscript from 'youtube-transcript'; 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// Puente de emergencia para librerías caprichosas
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const YoutubeTranscript = require('youtube-transcript').YoutubeTranscript || require('youtube-transcript');
 
 dotenv.config();
 
@@ -13,8 +16,8 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
+// Configuramos Gemini con la variable de entorno o el modelo directo
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-// Usamos gemini-1.5-flash-latest como acordamos
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 
 async function obtenerTexto(input) {
@@ -22,12 +25,13 @@ async function obtenerTexto(input) {
     if (!esYoutube) return input;
 
     try {
-        // La llamada a la función se mantiene igual
+        // Intentamos extraer la transcripción
         const transcript = await YoutubeTranscript.fetchTranscript(input, { lang: 'es' })
             .catch(() => YoutubeTranscript.fetchTranscript(input, { lang: 'en' }));
+        
         return transcript.map(item => item.text).join(' ');
     } catch (e) {
-        throw new Error('No se pudo obtener la transcripción. ¿El video tiene subtítulos?');
+        throw new Error('No se pudo obtener la transcripción del video. ¿Tiene subtítulos?');
     }
 }
 
@@ -50,14 +54,14 @@ app.post('/api/estudiar', async (req, res) => {
         const textResponse = result.response.text();
         const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
         
-        if (!jsonMatch) throw new Error("Respuesta de IA no válida");
+        if (!jsonMatch) throw new Error("La IA no devolvió un formato válido.");
 
         const data = JSON.parse(jsonMatch[0]);
         data.contexto = sourceText;
 
         res.json(data);
     } catch (error) {
-        console.error(error);
+        console.error("Error en /api/estudiar:", error);
         res.status(500).json({ error: error.message });
     }
 });
