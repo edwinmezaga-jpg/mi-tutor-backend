@@ -1,23 +1,25 @@
-const express = require('express');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const { YoutubeTranscript } = require('youtube-transcript');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { YoutubeTranscript } from 'youtube-transcript';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Configuración de CORS
 app.use(cors());
 app.use(express.json());
 
-// Inicialización de Gemini
+// Chequeo de seguridad
+if (!process.env.GEMINI_API_KEY) {
+    console.error("⚠️ ADVERTENCIA: No se encontró la GEMINI_API_KEY en Render.");
+}
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 
-// Función mágica para leer YouTube
 async function obtenerTexto(input) {
     const esYoutube = /youtu\.be|youtube\.com/i.test(input);
     if (!esYoutube) return input;
@@ -27,37 +29,35 @@ async function obtenerTexto(input) {
             .catch(() => YoutubeTranscript.fetchTranscript(input, { lang: 'en' }));
         return transcript.map(item => item.text).join(' ');
     } catch (e) {
-        throw new Error('No se pudo obtener la transcripción del video. Asegúrate de que tenga subtítulos habilitados.');
+        throw new Error('No se pudo extraer la transcripción. Asegúrate de que el video tenga subtítulos.');
     }
 }
 
-// Ruta principal: Procesa el link o texto
 app.post('/api/estudiar', async (req, res) => {
     try {
         const { input } = req.body;
-        if (!input) return res.status(400).json({ error: "No enviaste contenido" });
+        if (!input) return res.status(400).json({ error: "Falta contenido" });
 
         const sourceText = await obtenerTexto(input);
 
-        const prompt = `Actúa como un tutor experto. Analiza el siguiente contenido y responde ÚNICAMENTE con un objeto JSON (sin bloques de código markdown):
+        const prompt = `Actúa como un tutor experto. Analiza el siguiente contenido y responde ÚNICAMENTE con formato JSON estricto (sin texto antes o después):
         {
-          "titulo": "Título breve",
-          "resumen": "Resumen de 3 párrafos explicando los puntos clave",
+          "titulo": "Título de la clase",
+          "resumen": "Resumen de 3 párrafos",
           "quiz": [
-            {"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C"], "r": 0}
+            {"p": "Pregunta", "o": ["A", "B", "C"], "r": 0}
           ]
         }
-        Contenido a procesar: ${sourceText}`;
+        Contenido: ${sourceText}`;
 
         const result = await model.generateContent(prompt);
         const textResponse = result.response.text();
         
-        // Limpiamos la respuesta por si Gemini agrega ```json
         const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("Respuesta de IA no válida");
+        if (!jsonMatch) throw new Error("La IA no devolvió el formato esperado.");
 
         const data = JSON.parse(jsonMatch[0]);
-        data.contexto = sourceText; // Guardamos el texto para el chat posterior
+        data.contexto = sourceText;
 
         res.json(data);
     } catch (error) {
@@ -66,11 +66,10 @@ app.post('/api/estudiar', async (req, res) => {
     }
 });
 
-// Ruta del Chat: Responde preguntas de seguimiento
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
-        const prompt = `Contexto: ${context}\n\nPregunta del estudiante: ${question}`;
+        const prompt = `Contexto: ${context}\n\nPregunta: ${question}`;
         const result = await model.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
@@ -78,4 +77,4 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor volando en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor en línea en el puerto ${PORT}`));
