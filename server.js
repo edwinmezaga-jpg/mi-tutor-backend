@@ -1,8 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { YoutubeTranscript } from 'youtube-transcript';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// 🔴 LA MAGIA FUERA DE LA CAJA: Creamos un "puente" para la librería rebelde
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { YoutubeTranscript } = require('youtube-transcript');
 
 dotenv.config();
 
