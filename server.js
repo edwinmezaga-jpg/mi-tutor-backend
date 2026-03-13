@@ -1,40 +1,37 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-
-// Puente de emergencia para librerías caprichosas
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const YoutubeTranscript = require('youtube-transcript').YoutubeTranscript || require('youtube-transcript');
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const { YoutubeTranscript } = require('youtube-transcript');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Configuración de CORS
 app.use(cors());
 app.use(express.json());
 
-// Configuramos Gemini con la variable de entorno o el modelo directo
+// Inicialización de Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 
+// Función mágica para leer YouTube
 async function obtenerTexto(input) {
     const esYoutube = /youtu\.be|youtube\.com/i.test(input);
     if (!esYoutube) return input;
 
     try {
-        // Intentamos extraer la transcripción
         const transcript = await YoutubeTranscript.fetchTranscript(input, { lang: 'es' })
             .catch(() => YoutubeTranscript.fetchTranscript(input, { lang: 'en' }));
-        
         return transcript.map(item => item.text).join(' ');
     } catch (e) {
-        throw new Error('No se pudo obtener la transcripción del video. ¿Tiene subtítulos?');
+        throw new Error('No se pudo obtener la transcripción del video. Asegúrate de que tenga subtítulos habilitados.');
     }
 }
 
+// Ruta principal: Procesa el link o texto
 app.post('/api/estudiar', async (req, res) => {
     try {
         const { input } = req.body;
@@ -42,34 +39,38 @@ app.post('/api/estudiar', async (req, res) => {
 
         const sourceText = await obtenerTexto(input);
 
-        const prompt = `Actúa como un tutor experto. Analiza el contenido y responde ÚNICAMENTE con un JSON:
+        const prompt = `Actúa como un tutor experto. Analiza el siguiente contenido y responde ÚNICAMENTE con un objeto JSON (sin bloques de código markdown):
         {
           "titulo": "Título breve",
-          "resumen": "Resumen de 3 párrafos",
-          "quiz": [{"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C"], "r": 0}]
+          "resumen": "Resumen de 3 párrafos explicando los puntos clave",
+          "quiz": [
+            {"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C"], "r": 0}
+          ]
         }
-        Contenido: ${sourceText}`;
+        Contenido a procesar: ${sourceText}`;
 
         const result = await model.generateContent(prompt);
         const textResponse = result.response.text();
-        const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
         
-        if (!jsonMatch) throw new Error("La IA no devolvió un formato válido.");
+        // Limpiamos la respuesta por si Gemini agrega ```json
+        const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("Respuesta de IA no válida");
 
         const data = JSON.parse(jsonMatch[0]);
-        data.contexto = sourceText;
+        data.contexto = sourceText; // Guardamos el texto para el chat posterior
 
         res.json(data);
     } catch (error) {
-        console.error("Error en /api/estudiar:", error);
+        console.error(error);
         res.status(500).json({ error: error.message });
     }
 });
 
+// Ruta del Chat: Responde preguntas de seguimiento
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
-        const prompt = `Contexto: ${context}\n\nPregunta: ${question}`;
+        const prompt = `Contexto: ${context}\n\nPregunta del estudiante: ${question}`;
         const result = await model.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
