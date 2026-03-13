@@ -1,8 +1,8 @@
-const express = require('express');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const { YoutubeTranscript } = require('youtube-transcript');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { getSubtitles } from 'youtube-captions-scraper';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
@@ -18,28 +18,41 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || "gemini-1.5-flash-latest"
+    model: process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest'
 });
 
-// ── Extrae texto: YouTube → subtítulos, lo demás → texto directo
+// ── Extrae el video ID de una URL de YouTube
+function extraerVideoId(url) {
+    const match = url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
+    return match ? match[1] : null;
+}
+
+// ── Obtiene texto: YouTube → subtítulos, lo demás → texto directo
 async function obtenerTexto(input) {
     const esYoutube = /youtu\.be|youtube\.com/i.test(input);
     if (!esYoutube) return input;
 
+    const videoId = extraerVideoId(input);
+    if (!videoId) throw new Error('No se pudo extraer el ID del video de YouTube.');
+
+    let subtitulos;
     try {
-        let transcript;
+        // Intentar español primero
+        subtitulos = await getSubtitles({ videoID: videoId, lang: 'es' });
+    } catch {
         try {
-            transcript = await YoutubeTranscript.fetchTranscript(input, { lang: 'es' });
+            // Si no hay en español, intentar inglés
+            subtitulos = await getSubtitles({ videoID: videoId, lang: 'en' });
         } catch {
-            transcript = await YoutubeTranscript.fetchTranscript(input, { lang: 'en' });
+            throw new Error('No se pudo extraer la transcripción. (Sin subtítulos o video privado).');
         }
-        if (!transcript || transcript.length === 0) {
-            throw new Error('Transcripción vacía.');
-        }
-        return transcript.map(item => item.text).join(' ');
-    } catch (e) {
-        throw new Error('No se pudo extraer la transcripción. (Sin subtítulos o video privado).');
     }
+
+    if (!subtitulos || subtitulos.length === 0) {
+        throw new Error('El video no tiene subtítulos disponibles.');
+    }
+
+    return subtitulos.map(s => s.text).join(' ');
 }
 
 // ── POST /api/estudiar
@@ -68,14 +81,14 @@ Contenido: ${sourceText}`;
         const textResponse = result.response.text();
 
         const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("La IA no devolvió JSON válido. Intenta de nuevo.");
+        if (!jsonMatch) throw new Error('La IA no devolvió JSON válido. Intenta de nuevo.');
 
         const data = JSON.parse(jsonMatch[0]);
         data.contexto = sourceText.substring(0, 8000);
 
         res.json(data);
     } catch (error) {
-        console.error("Error en /api/estudiar:", error.message);
+        console.error('Error en /api/estudiar:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -99,7 +112,7 @@ ${question}`;
         const result = await model.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
-        console.error("Error en /api/chat:", error.message);
+        console.error('Error en /api/chat:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -111,6 +124,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-    console.log(`   Modelo: ${process.env.GEMINI_MODEL || "gemini-1.5-flash-latest"}`);
+    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest'}`);
 });
-
