@@ -3,10 +3,9 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-// 🔴 LA MAGIA FUERA DE LA CAJA: Creamos un "puente" para la librería rebelde
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const { YoutubeTranscript } = require('youtube-transcript');
+// 🔴 AQUÍ ESTÁ EL ARREGLO: Importamos la caja entera y luego sacamos YoutubeTranscript
+import pkg from 'youtube-transcript';
+const { YoutubeTranscript } = pkg;
 
 dotenv.config();
 
