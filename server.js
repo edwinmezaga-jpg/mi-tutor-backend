@@ -3,9 +3,9 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-// 🔴 AQUÍ ESTÁ EL ARREGLO: Importamos la caja entera y luego sacamos YoutubeTranscript
-import pkg from 'youtube-transcript';
-const { YoutubeTranscript } = pkg;
+// 🔴 EL TRUCO DEFINITIVO: Importación comodín (*)
+import * as yt from 'youtube-transcript';
+const YoutubeTranscript = yt.YoutubeTranscript || yt.default?.YoutubeTranscript || yt.default;
 
 dotenv.config();
 
