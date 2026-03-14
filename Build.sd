@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Instala yt-dlp como binario en el servidor de Render
-echo "📦 Instalando yt-dlp..."
-curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /opt/render/project/src/yt-dlp
-chmod +x /opt/render/project/src/yt-dlp
-echo "✅ yt-dlp instalado correctamente"
-
-# Instala dependencias de Node
-npm install
