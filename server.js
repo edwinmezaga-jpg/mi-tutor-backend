@@ -1,15 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { readFile, unlink, readdir } from 'fs/promises';
-import { join } from 'path';
+import multer from 'multer';
+import { readFile, unlink } from 'fs/promises';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
-const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -19,118 +16,70 @@ app.use(express.json());
 if (!process.env.GEMINI_API_KEY) {
     console.error("⚠️  FALTA GEMINI_API_KEY en Render → Environment");
 }
+if (!process.env.GEMINI_API_KEY_IMAGEN) {
+    console.warn("⚠️  FALTA GEMINI_API_KEY_IMAGEN — las imágenes no se generarán");
+}
 
+// ── Cliente texto: gemini-2.5-flash (cuenta 1)
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const model = genAI.getGenerativeModel({
+const modelTexto = genAI.getGenerativeModel({
     model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
 });
 
-// Ruta donde Render guarda el binario de yt-dlp
-const YTDLP = '/opt/render/project/src/yt-dlp';
+// ── Cliente imagen: gemini-2.5-flash-image Nano Banana (cuenta 2)
+const genAIImagen = new GoogleGenerativeAI(
+    process.env.GEMINI_API_KEY_IMAGEN || process.env.GEMINI_API_KEY || ''
+);
+const modelImagen = genAIImagen.getGenerativeModel({
+    model: 'gemini-2.5-flash-image',
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+});
 
-// ── Extrae el video ID de cualquier URL de YouTube
-function extraerVideoId(url) {
-    const patterns = [
-        /youtu\.be\/([^?&\s]+)/,
-        /youtube\.com\/watch\?v=([^&\s]+)/,
-        /youtube\.com\/embed\/([^?&\s]+)/,
-        /youtube\.com\/shorts\/([^?&\s]+)/,
-    ];
-    for (const p of patterns) {
-        const m = url.match(p);
-        if (m) return m[1];
+// ── Multer — archivos temporales en /tmp, máx 20MB
+const upload = multer({
+    dest: '/tmp/',
+    limits: { fileSize: 20 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error('Solo se permiten imágenes (JPG, PNG, WEBP) o PDF.'));
     }
-    return null;
+});
+
+// ── Convierte archivo a base64
+async function archivoABase64(path, mimetype) {
+    const buffer = await readFile(path);
+    return { data: buffer.toString('base64'), mimeType: mimetype };
 }
 
-// ── Descarga subtítulos con yt-dlp y devuelve el texto
-async function obtenerSubtitulosYouTube(videoId) {
-    const tmpDir = '/tmp';
-    const tmpBase = join(tmpDir, `sub_${videoId}_${Date.now()}`);
-
+// ── Genera imagen educativa con Nano Banana
+async function generarImagenExplicativa(titulo, resumen) {
     try {
-        // Intenta español primero, luego inglés, luego automáticos
-        const cmd = `${YTDLP} \
-            --skip-download \
-            --write-subs \
-            --write-auto-subs \
-            --sub-langs "es,es-MX,es-419,en" \
-            --sub-format vtt \
-            --convert-subs vtt \
-            -o "${tmpBase}" \
-            "https://www.youtube.com/watch?v=${videoId}" \
-            2>&1`;
+        const prompt = `Crea una ilustración educativa, colorida y clara sobre el tema: "${titulo}". 
+El estilo debe ser como el de un libro de texto moderno para estudiantes de secundaria: 
+diagramas simples, iconos, flechas explicativas, colores vivos. 
+Basado en: ${resumen.substring(0, 300)}`;
 
-        console.log(`📺 Descargando subtítulos del video: ${videoId}`);
-        await execAsync(cmd, { timeout: 30000 });
+        const result = await modelImagen.generateContent(prompt);
 
-        // Buscar el archivo .vtt que se generó
-        const files = await readdir(tmpDir);
-        const vttFile = files.find(f => f.startsWith(`sub_${videoId}`) && f.endsWith('.vtt'));
-
-        if (!vttFile) {
-            throw new Error('No se encontraron subtítulos para este video.');
+        for (const part of result.response.candidates[0].content.parts) {
+            if (part.inlineData) {
+                return {
+                    data: part.inlineData.data,
+                    mimeType: part.inlineData.mimeType
+                };
+            }
         }
-
-        const fullPath = join(tmpDir, vttFile);
-        const vttContent = await readFile(fullPath, 'utf8');
-
-        // Limpiar archivo temporal
-        await unlink(fullPath).catch(() => {});
-
-        // Parsear el VTT y extraer solo el texto
-        const texto = vttContent
-            .split('\n')
-            .filter(line =>
-                line.trim() &&
-                !line.startsWith('WEBVTT') &&
-                !line.startsWith('NOTE') &&
-                !line.match(/^\d{2}:\d{2}/) && // timestamps
-                !line.match(/^[\d]+$/)           // números de índice
-            )
-            .map(line => line.replace(/<[^>]+>/g, '').trim()) // quitar tags HTML
-            .filter(line => line.length > 0)
-            .join(' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        if (!texto) throw new Error('Los subtítulos estaban vacíos.');
-
-        console.log(`✅ Subtítulos extraídos: ${texto.length} caracteres`);
-        return texto;
-
+        return null;
     } catch (e) {
-        // Limpiar archivos temporales en caso de error
-        try {
-            const files = await readdir(tmpDir);
-            const tmpFiles = files.filter(f => f.startsWith(`sub_${videoId}`));
-            await Promise.all(tmpFiles.map(f => unlink(join(tmpDir, f)).catch(() => {})));
-        } catch {}
-
-        throw new Error(`No se pudieron obtener los subtítulos: ${e.message}`);
+        console.error('Error generando imagen:', e.message);
+        return null;
     }
 }
 
-// ── Decide si es YouTube o texto directo
-async function obtenerTexto(input) {
-    const esYoutube = /youtu\.be|youtube\.com/i.test(input);
-    if (!esYoutube) return input;
-
-    const videoId = extraerVideoId(input);
-    if (!videoId) throw new Error('No se pudo leer el ID del video. Verifica el link.');
-
-    return await obtenerSubtitulosYouTube(videoId);
-}
-
-// ── POST /api/estudiar
-app.post('/api/estudiar', async (req, res) => {
-    try {
-        const { input } = req.body;
-        if (!input) return res.status(400).json({ error: "Falta el campo 'input'." });
-
-        const sourceText = await obtenerTexto(input);
-
-        const prompt = `Actúa como un tutor experto para estudiantes de secundaria y preparatoria.
+// ── Función central: texto → título + resumen + quiz + imagen
+async function procesarConIA(sourceText) {
+    const prompt = `Actúa como un tutor experto para estudiantes de secundaria y preparatoria.
 Analiza el siguiente contenido y responde ÚNICAMENTE con un JSON válido, sin texto extra antes ni después, sin bloques de código markdown:
 {
   "titulo": "Título claro del tema",
@@ -144,19 +93,78 @@ Analiza el siguiente contenido y responde ÚNICAMENTE con un JSON válido, sin t
 El campo "r" es el índice (0, 1 o 2) de la respuesta correcta dentro del arreglo "o".
 Contenido: ${sourceText}`;
 
-        const result = await model.generateContent(prompt);
-        const textResponse = result.response.text();
+    const result = await modelTexto.generateContent(prompt);
+    const textResponse = result.response.text();
 
-        const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error('La IA no devolvió JSON válido. Intenta de nuevo.');
+    const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('La IA no devolvió JSON válido. Intenta de nuevo.');
 
-        const data = JSON.parse(jsonMatch[0]);
-        data.contexto = sourceText.substring(0, 8000);
+    const data = JSON.parse(jsonMatch[0]);
+    data.contexto = sourceText.substring(0, 8000);
 
-        res.json(data);
+    console.log('🎨 Generando imagen con Nano Banana...');
+    const imagen = await generarImagenExplicativa(data.titulo, data.resumen);
+    if (imagen) {
+        data.imagen = `data:${imagen.mimeType};base64,${imagen.data}`;
+        console.log('✅ Imagen generada correctamente');
+    } else {
+        console.log('⚠️  Sin imagen, continuando sin ella');
+    }
+
+    return data;
+}
+
+// ── POST /api/estudiar — texto plano
+app.post('/api/estudiar', async (req, res) => {
+    try {
+        const { input } = req.body;
+        if (!input) return res.status(400).json({ error: "Falta el campo 'input'." });
+        const resultado = await procesarConIA(input);
+        res.json(resultado);
     } catch (error) {
         console.error('Error en /api/estudiar:', error.message);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ── POST /api/estudiar-archivo — foto o PDF
+app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => {
+    const tmpPath = req.file?.path;
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo.' });
+
+        let sourceText = '';
+
+        if (req.file.mimetype === 'application/pdf') {
+            console.log('📄 Procesando PDF...');
+            const { data, mimeType } = await archivoABase64(tmpPath, 'application/pdf');
+            const result = await modelTexto.generateContent([
+                { inlineData: { data, mimeType } },
+                { text: 'Extrae y devuelve TODO el texto de este PDF tal como aparece, sin resumir ni modificar nada.' }
+            ]);
+            sourceText = result.response.text();
+        } else {
+            console.log('🖼️  Procesando imagen...');
+            const { data, mimeType } = await archivoABase64(tmpPath, req.file.mimetype);
+            const result = await modelTexto.generateContent([
+                { inlineData: { data, mimeType } },
+                { text: 'Extrae y devuelve TODO el texto visible en esta imagen tal como aparece, sin resumir ni modificar nada.' }
+            ]);
+            sourceText = result.response.text();
+        }
+
+        if (!sourceText || sourceText.trim().length < 20) {
+            throw new Error('No se pudo extraer texto del archivo. Asegúrate de que sea legible.');
+        }
+
+        const resultado = await procesarConIA(sourceText);
+        res.json(resultado);
+
+    } catch (error) {
+        console.error('Error en /api/estudiar-archivo:', error.message);
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (tmpPath) await unlink(tmpPath).catch(() => {});
     }
 });
 
@@ -176,7 +184,7 @@ ${context}
 Pregunta del alumno:
 ${question}`;
 
-        const result = await model.generateContent(prompt);
+        const result = await modelTexto.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
         console.error('Error en /api/chat:', error.message);
@@ -184,12 +192,13 @@ ${question}`;
     }
 });
 
-// ── GET / — verificar que el servidor vive
+// ── GET /
 app.get('/', (req, res) => {
     res.json({ status: 'ok', message: '🚀 Tutor Backend activo y funcionando.' });
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}`);
+    console.log(`   Texto:  ${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}`);
+    console.log(`   Imagen: gemini-2.5-flash-image (Nano Banana)`);
 });
