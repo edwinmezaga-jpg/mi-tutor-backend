@@ -22,7 +22,7 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// 💡 TRUCO FUERA DE LA CAJA: Obligamos a Gemini a responder en JSON nativo
+// 💡 OBLIGAMOS a la IA a responder siempre en formato JSON perfecto
 const model = genAI.getGenerativeModel({ 
     model: 'gemini-2.5-flash',
     generationConfig: { responseMimeType: "application/json" } 
@@ -30,7 +30,7 @@ const model = genAI.getGenerativeModel({
 
 const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
 
-// ── 🌐 Lector Web Rápido
+// ── 🌐 Lector Web Rápido con "Disfraz"
 async function extraerTextoWeb(url) {
     try {
         const response = await axios.get(url, { 
@@ -57,13 +57,12 @@ async function extraerTextoWeb(url) {
     }
 }
 
-// ── Procesador de IA Ultrarrápido
+// ── Procesador de IA Ultrarrápido (Ahora con Flashcards)
 async function procesarConIA(sourceText) {
     if (!sourceText || sourceText.length < 50) {
         throw new Error("No se encontró suficiente texto en el enlace o documento para analizar.");
     }
 
-    // Le pasamos solo el esquema y el contenido
     const prompt = `
     Actúa como un tutor experto. Crea una clase detallada y didáctica.
     Usa etiquetas HTML como <br> para separar párrafos y <b> para negritas.
@@ -72,6 +71,11 @@ async function procesarConIA(sourceText) {
     {
       "titulo": "Título de la clase",
       "resumen": "Clase magistral profunda y bien explicada",
+      "flashcards": [
+        {"anverso": "Concepto Clave 1", "reverso": "Definición corta y fácil de recordar"},
+        {"anverso": "Concepto Clave 2", "reverso": "Definición corta y fácil de recordar"},
+        {"anverso": "Concepto Clave 3", "reverso": "Definición corta y fácil de recordar"}
+      ],
       "quiz": [
         {"p": "Pregunta 1", "o": ["A", "B", "C"], "r": 0},
         {"p": "Pregunta 2", "o": ["A", "B", "C"], "r": 1},
@@ -82,14 +86,14 @@ async function procesarConIA(sourceText) {
 
     const result = await model.generateContent(prompt);
     
-    // 💡 Como activamos JSON nativo, Gemini nos devuelve un string perfecto
+    // Como activamos JSON nativo, podemos parsearlo directamente sin miedo
     const data = JSON.parse(result.response.text());
-    data.contexto = sourceText.substring(0, 10000); // Guardamos para el chat
+    data.contexto = sourceText.substring(0, 10000); 
     
     return data;
 }
 
-// ── RUTAS
+// ── RUTAS PRINCIPALES ──
 
 app.post('/api/estudiar', async (req, res) => {
     try {
@@ -116,12 +120,11 @@ app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => 
         const fileBuffer = await readFile(tmpPath);
         let sourceText = '';
 
-        // 💡 TRUCO DE VELOCIDAD: Leemos el PDF en tu servidor, no en Gemini
+        // Leemos el PDF localmente y rapidísimo
         if (req.file.mimetype === 'application/pdf') {
             const data = await pdfParse(fileBuffer);
             sourceText = data.text;
         } else {
-            // Si es imagen u otro texto, lo leemos como string
             sourceText = fileBuffer.toString('utf-8');
         }
 
