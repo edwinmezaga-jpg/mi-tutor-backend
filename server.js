@@ -3,7 +3,6 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import { readFile, unlink } from 'fs/promises';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pdfParse from 'pdf-parse';
@@ -16,21 +15,34 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-if (!process.env.GEMINI_API_KEY)   console.error("⚠️  FALTA GEMINI_API_KEY");
-if (!process.env.ELEVENLABS_API_KEY) console.warn("⚠️  FALTA ELEVENLABS_API_KEY — podcast desactivado");
+if (!process.env.GROQ_API_KEY)       console.error("⚠️  FALTA GROQ_API_KEY");
+if (!process.env.ELEVENLABS_API_KEY) console.warn("⚠️  FALTA ELEVENLABS_API_KEY");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-// Lee el modelo desde Render: GEMINI_MODEL=gemini-2.0-flash-lite
-const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite',
-    generationConfig: { responseMimeType: "application/json" }
-});
+// ── Llamada a Groq
+async function groqCall(messages, jsonMode = false) {
+    const body = {
+        model: GROQ_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: 4096
+    };
+    if (jsonMode) body.response_format = { type: 'json_object' };
 
-// Modelo de chat (sin JSON forzado)
-const chatModel = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
-});
+    const response = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        body,
+        {
+            headers: {
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 30000
+        }
+    );
+    return response.data.choices[0].message.content;
+}
 
 const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -63,34 +75,42 @@ async function procesarConIA(sourceText) {
     if (!sourceText || sourceText.length < 50)
         throw new Error("No se encontró suficiente texto para analizar.");
 
-    const prompt = `
-Actúa como un tutor experto. Crea una clase detallada y didáctica en español.
-Usa <br> para saltos de párrafo y <b> para conceptos importantes.
+    const messages = [
+        {
+            role: 'system',
+            content: `Eres un tutor experto. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown, sin bloques de código.`
+        },
+        {
+            role: 'user',
+            content: `Crea una clase didáctica en español sobre el siguiente contenido.
+Usa <br> para saltos de párrafo y <b> para conceptos importantes en el resumen.
 
-Devuelve ÚNICAMENTE este JSON sin ningún texto extra:
+Devuelve EXACTAMENTE este JSON:
 {
   "titulo": "Título claro de la clase",
-  "resumen": "Clase magistral completa con formato HTML usando <b> y <br>",
+  "resumen": "Clase magistral completa con <b>negritas</b> y <br> para párrafos",
   "quiz": [
-    {"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
-    {"p": "Pregunta 2", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
-    {"p": "Pregunta 3", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
-    {"p": "Pregunta 4", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
-    {"p": "Pregunta 5", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0}
+    {"p": "Pregunta 1", "o": ["A", "B", "C", "D"], "r": 0},
+    {"p": "Pregunta 2", "o": ["A", "B", "C", "D"], "r": 1},
+    {"p": "Pregunta 3", "o": ["A", "B", "C", "D"], "r": 2},
+    {"p": "Pregunta 4", "o": ["A", "B", "C", "D"], "r": 3},
+    {"p": "Pregunta 5", "o": ["A", "B", "C", "D"], "r": 0}
   ],
   "flashcards": [
-    {"anverso": "Concepto 1", "reverso": "Definición corta 1"},
-    {"anverso": "Concepto 2", "reverso": "Definición corta 2"},
-    {"anverso": "Concepto 3", "reverso": "Definición corta 3"},
-    {"anverso": "Concepto 4", "reverso": "Definición corta 4"},
-    {"anverso": "Concepto 5", "reverso": "Definición corta 5"}
+    {"anverso": "Concepto 1", "reverso": "Definición 1"},
+    {"anverso": "Concepto 2", "reverso": "Definición 2"},
+    {"anverso": "Concepto 3", "reverso": "Definición 3"},
+    {"anverso": "Concepto 4", "reverso": "Definición 4"},
+    {"anverso": "Concepto 5", "reverso": "Definición 5"}
   ]
 }
 
-Contenido: ${sourceText.substring(0, 30000)}`;
+Contenido: ${sourceText.substring(0, 28000)}`
+        }
+    ];
 
-    const result = await model.generateContent(prompt);
-    const data = JSON.parse(result.response.text());
+    const text = await groqCall(messages, true);
+    const data = JSON.parse(text);
     data.contexto = sourceText.substring(0, 10000);
     return data;
 }
@@ -128,9 +148,12 @@ app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => 
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
-        const prompt = `Contexto de la clase:\n${context}\n\nResponde como tutor amable: ${question}`;
-        const result = await chatModel.generateContent(prompt);
-        res.json({ answer: result.response.text() });
+        const messages = [
+            { role: 'system', content: 'Eres un tutor amable y claro. Responde en español de forma concisa.' },
+            { role: 'user', content: `Contexto de la clase:\n${context}\n\nDuda del alumno: ${question}` }
+        ];
+        const answer = await groqCall(messages);
+        res.json({ answer });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -150,7 +173,7 @@ app.post('/api/podcast', async (req, res) => {
             .trim()
             .substring(0, 2500);
 
-        const VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; // Rachel — multilingual
+        const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
 
         const response = await axios.post(
             `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
@@ -178,4 +201,4 @@ app.post('/api/podcast', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`🚀 Tutor IA activo en puerto ${PORT} — modelo: ${process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'}`));
+app.listen(PORT, () => console.log(`🚀 Tutor IA activo en puerto ${PORT} — modelo: ${GROQ_MODEL}`));
