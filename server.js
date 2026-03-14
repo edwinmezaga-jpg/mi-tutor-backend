@@ -7,28 +7,28 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pdfParse from 'pdf-parse';
-
+ 
 dotenv.config();
-
+ 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
+ 
 app.use(cors());
 app.use(express.json());
-
+ 
 if (!process.env.GEMINI_API_KEY) {
     console.error("⚠️ FALTA GEMINI_API_KEY");
 }
-
+ 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-
+ 
 const model = genAI.getGenerativeModel({ 
-    model: 'gemini-1.5-flash-latest',
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
     generationConfig: { responseMimeType: "application/json" } 
 });
-
+ 
 const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
-
+ 
 // ── 🌐 Lector Web
 async function extraerTextoWeb(url) {
     try {
@@ -55,13 +55,13 @@ async function extraerTextoWeb(url) {
         throw new Error("El sitio web bloqueó la lectura. Por favor, copia y pega el texto directamente.");
     }
 }
-
+ 
 // ── Procesador de IA
 async function procesarConIA(sourceText) {
     if (!sourceText || sourceText.length < 50) {
         throw new Error("No se encontró suficiente texto en el enlace o documento para analizar.");
     }
-
+ 
     const prompt = `
     Actúa como un tutor experto. Crea una clase detallada y didáctica.
     Usa etiquetas HTML como <br> para separar párrafos y <b> para negritas.
@@ -85,23 +85,23 @@ async function procesarConIA(sourceText) {
         {"anverso": "Concepto clave 5", "reverso": "Definición o explicación corta del concepto 5"}
       ]
     }
-
+ 
     REGLAS:
     - El quiz debe tener EXACTAMENTE 5 preguntas con 4 opciones cada una.
     - Las flashcards deben tener los 5 conceptos más importantes del texto.
     - El campo "r" del quiz es el índice (0-3) de la respuesta correcta dentro del array "o".
     
     Contenido a enseñar: ${sourceText.substring(0, 35000)}`;
-
+ 
     const result = await model.generateContent(prompt);
     const data = JSON.parse(result.response.text());
     data.contexto = sourceText.substring(0, 10000);
     
     return data;
 }
-
+ 
 // ── RUTAS
-
+ 
 app.post('/api/estudiar', async (req, res) => {
     try {
         const { input } = req.body;
@@ -118,7 +118,7 @@ app.post('/api/estudiar', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
+ 
 app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => {
     const tmpPath = req.file?.path;
     try {
@@ -126,14 +126,14 @@ app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => 
         
         const fileBuffer = await readFile(tmpPath);
         let sourceText = '';
-
+ 
         if (req.file.mimetype === 'application/pdf') {
             const data = await pdfParse(fileBuffer);
             sourceText = data.text;
         } else {
             sourceText = fileBuffer.toString('utf-8');
         }
-
+ 
         const resultado = await procesarConIA(sourceText);
         res.json(resultado);
     } catch (error) {
@@ -142,7 +142,7 @@ app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => 
         if (tmpPath) await unlink(tmpPath).catch(() => {});
     }
 });
-
+ 
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
@@ -153,27 +153,27 @@ app.post('/api/chat', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
+ 
 // ── 🎙️ Podcast con ElevenLabs
 app.post('/api/podcast', async (req, res) => {
     try {
         const { texto } = req.body;
         if (!texto) return res.status(400).json({ error: "Falta el texto." });
-
+ 
         if (!process.env.ELEVENLABS_API_KEY) {
             return res.status(500).json({ error: "Falta ELEVENLABS_API_KEY en el servidor." });
         }
-
+ 
         // Limpiamos HTML tags y limitamos a 2500 caracteres (free tier)
         const textoLimpio = texto
             .replace(/<[^>]*>/g, ' ')
             .replace(/\s+/g, ' ')
             .trim()
             .substring(0, 2500);
-
+ 
         // Voz "Rachel" en español — natural y clara
         const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
-
+ 
         const response = await axios.post(
             `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
             {
@@ -190,10 +190,10 @@ app.post('/api/podcast', async (req, res) => {
                 responseType: 'arraybuffer'
             }
         );
-
+ 
         res.set('Content-Type', 'audio/mpeg');
         res.send(Buffer.from(response.data));
-
+ 
     } catch (error) {
         const msg = error.response?.data
             ? Buffer.from(error.response.data).toString()
@@ -201,5 +201,5 @@ app.post('/api/podcast', async (req, res) => {
         res.status(500).json({ error: msg });
     }
 });
-
+ 
 app.listen(PORT, () => console.log(`🚀 Servidor Tutor IA activo en puerto ${PORT}`));
