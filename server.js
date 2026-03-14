@@ -4,6 +4,10 @@ import dotenv from 'dotenv';
 import multer from 'multer';
 import { readFile, unlink } from 'fs/promises';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Innertube, UniversalCache } from 'youtubei.js';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import pdfParse from 'pdf-parse';
 
 dotenv.config();
 
@@ -13,192 +17,157 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
-if (!process.env.GEMINI_API_KEY) {
-    console.error("⚠️  FALTA GEMINI_API_KEY en Render → Environment");
-}
-if (!process.env.GEMINI_API_KEY_IMAGEN) {
-    console.warn("⚠️  FALTA GEMINI_API_KEY_IMAGEN — las imágenes no se generarán");
-}
-
-// ── Cliente texto: gemini-2.5-flash (cuenta 1)
+// ── Clientes de Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const modelTexto = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
-});
+const modelTexto = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-// ── Cliente imagen: gemini-2.5-flash-image Nano Banana (cuenta 2)
-const genAIImagen = new GoogleGenerativeAI(
-    process.env.GEMINI_API_KEY_IMAGEN || process.env.GEMINI_API_KEY || ''
-);
-const modelImagen = genAIImagen.getGenerativeModel({
-    model: 'gemini-2.5-flash-image',
-    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
-});
-
-// ── Multer — archivos temporales en /tmp, máx 20MB
-const upload = multer({
-    dest: '/tmp/',
-    limits: { fileSize: 20 * 1024 * 1024 },
-    fileFilter: (req, file, cb) => {
-        const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
-        if (allowed.includes(file.mimetype)) cb(null, true);
-        else cb(new Error('Solo se permiten imágenes (JPG, PNG, WEBP) o PDF.'));
-    }
-});
-
-// ── Convierte archivo a base64
-async function archivoABase64(path, mimetype) {
-    const buffer = await readFile(path);
-    return { data: buffer.toString('base64'), mimeType: mimetype };
-}
-
-// ── Genera imagen educativa con Nano Banana
-async function generarImagenExplicativa(titulo, resumen) {
+// ── 1. Función para extraer texto de sitios web y PDFs por URL
+async function extraerTextoWeb(url) {
     try {
-        const prompt = `Crea una ilustración educativa, colorida y clara sobre el tema: "${titulo}". 
-El estilo debe ser como el de un libro de texto moderno para estudiantes de secundaria: 
-diagramas simples, iconos, flechas explicativas, colores vivos. 
-Basado en: ${resumen.substring(0, 300)}`;
+        console.log(`Descargando contenido real de: ${url}`);
+        // Descargamos la web o el pdf
+        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        const contentType = response.headers['content-type'] || '';
 
-        const result = await modelImagen.generateContent(prompt);
-
-        for (const part of result.response.candidates[0].content.parts) {
-            if (part.inlineData) {
-                return {
-                    data: part.inlineData.data,
-                    mimeType: part.inlineData.mimeType
-                };
-            }
+        // Si es un PDF
+        if (contentType.includes('application/pdf')) {
+            const data = await pdfParse(response.data);
+            return data.text;
+        } 
+        // Si es una página web (HTML)
+        else if (contentType.includes('text/html')) {
+            const html = response.data.toString('utf-8');
+            const $ = cheerio.load(html);
+            
+            // Eliminamos menús, anuncios, scripts y estilos para dejar solo el texto útil
+            $('script, style, nav, footer, aside, header, noscript').remove();
+            
+            // Extraemos el texto de los títulos y párrafos
+            const textoLimpio = $('h1, h2, h3, p, li, article, section').text().replace(/\s+/g, ' ').trim();
+            return textoLimpio;
+        } else {
+            return response.data.toString('utf-8');
         }
-        return null;
-    } catch (e) {
-        console.error('Error generando imagen:', e.message);
-        return null;
+    } catch (error) {
+        console.error("Error al leer la URL:", error.message);
+        throw new Error("No se pudo leer el contenido del sitio web. El sitio podría estar bloqueando el acceso o el link es inválido.");
     }
 }
 
-// ── Función central: texto → título + resumen + quiz + imagen
-async function procesarConIA(sourceText) {
-    const prompt = `Actúa como un tutor experto para estudiantes de secundaria y preparatoria.
-Analiza el siguiente contenido y responde ÚNICAMENTE con un JSON válido, sin texto extra antes ni después, sin bloques de código markdown:
-{
-  "titulo": "Título claro del tema",
-  "resumen": "Resumen explicativo en 3 párrafos usando lenguaje sencillo, separados por saltos de línea",
-  "quiz": [
-    {"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C"], "r": 0},
-    {"p": "Pregunta 2", "o": ["Opción A", "Opción B", "Opción C"], "r": 1},
-    {"p": "Pregunta 3", "o": ["Opción A", "Opción B", "Opción C"], "r": 2}
-  ]
+// ── 2. Función para YouTube
+function esYoutubeUrl(url) {
+    return /youtu\.be\/|youtube\.com\/(?:.*v=|.*\/|.*v\/)/i.test(url);
 }
-El campo "r" es el índice (0, 1 o 2) de la respuesta correcta dentro del arreglo "o".
-Contenido: ${sourceText}`;
 
-    const result = await modelTexto.generateContent(prompt);
-    const textResponse = result.response.text();
+function extraerVideoId(url) {
+    const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:.*v=|.*\/|.*v\/))([^"&?\/\s]{11})/);
+    return match ? match[1] : null;
+}
 
-    const jsonMatch = textResponse.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('La IA no devolvió JSON válido. Intenta de nuevo.');
+async function obtenerTextoDeYouTube(input) {
+    const videoId = extraerVideoId(input);
+    const yt = await Innertube.create({ cache: new UniversalCache(false), generate_session_locally: true });
+    const info = await yt.getBasicInfo(videoId, { client: 'WEB' }); 
+    const transcriptData = await info.getTranscript();
+    if (!transcriptData || !transcriptData.transcript) throw new Error("El video no tiene subtítulos.");
+    
+    return transcriptData.transcript.content.body.initial_segments.map(s => s.snippet.text).join(' ');
+}
 
-    const data = JSON.parse(jsonMatch[0]);
-    data.contexto = sourceText.substring(0, 8000);
+// ── 3. Procesador Central (El cerebro que decide qué leer)
+async function procesarEntrada(input) {
+    const textoIngresado = input.trim();
 
-    console.log('🎨 Generando imagen con Nano Banana...');
-    const imagen = await generarImagenExplicativa(data.titulo, data.resumen);
-    if (imagen) {
-        data.imagen = `data:${imagen.mimeType};base64,${imagen.data}`;
-        console.log('✅ Imagen generada correctamente');
-    } else {
-        console.log('⚠️  Sin imagen, continuando sin ella');
+    // Caso A: Es un link de YouTube
+    if (esYoutubeUrl(textoIngresado)) {
+        return await obtenerTextoDeYouTube(textoIngresado);
     }
-
-    return data;
+    // Caso B: Es un link de cualquier otro sitio web o PDF (empieza con http o https)
+    else if (textoIngresado.startsWith('http://') || textoIngresado.startsWith('https://')) {
+        return await extraerTextoWeb(textoIngresado);
+    }
+    // Caso C: Es texto puro pegado por el usuario
+    else {
+        return textoIngresado;
+    }
 }
 
-// ── POST /api/estudiar — texto plano
+// ── RUTAS
+
 app.post('/api/estudiar', async (req, res) => {
     try {
         const { input } = req.body;
-        if (!input) return res.status(400).json({ error: "Falta el campo 'input'." });
-        const resultado = await procesarConIA(input);
-        res.json(resultado);
+        if (!input) return res.status(400).json({ error: "Falta contenido" });
+
+        // Aquí el backend lee la información real antes de enviarla a Gemini
+        const sourceText = await procesarEntrada(input);
+
+        const prompt = `Actúa como un tutor experto. Analiza el siguiente contenido y responde ÚNICAMENTE con formato JSON estricto:
+        {
+          "titulo": "Título de la clase",
+          "resumen": "Resumen detallado de la información proporcionada",
+          "quiz": [
+            {"p": "Pregunta", "o": ["A", "B", "C"], "r": 0}
+          ]
+        }
+        Contenido real a analizar: ${sourceText.substring(0, 30000)}`; // Limitamos el texto a 30k caracteres para no saturar a Gemini
+
+        const result = await modelTexto.generateContent(prompt);
+        const jsonMatch = result.response.text().match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("La IA no devolvió JSON válido.");
+
+        const data = JSON.parse(jsonMatch[0]);
+        data.contexto = sourceText.substring(0, 15000); // Guardamos el contexto para el chat
+
+        res.json(data);
     } catch (error) {
-        console.error('Error en /api/estudiar:', error.message);
+        console.error("Error en /api/estudiar:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ── POST /api/estudiar-archivo — foto o PDF
+// ── Rutas de archivos y chat que ya tenías
+const upload = multer({ dest: '/tmp/' });
 app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => {
-    const tmpPath = req.file?.path;
+    let tmpPath = req.file?.path;
     try {
         if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo.' });
+        const mimetype = req.file.mimetype;
+        const fileBuffer = await readFile(tmpPath);
+        let textExtracted = "";
 
-        let sourceText = '';
-
-        if (req.file.mimetype === 'application/pdf') {
-            console.log('📄 Procesando PDF...');
-            const { data, mimeType } = await archivoABase64(tmpPath, 'application/pdf');
-            const result = await modelTexto.generateContent([
-                { inlineData: { data, mimeType } },
-                { text: 'Extrae y devuelve TODO el texto de este PDF tal como aparece, sin resumir ni modificar nada.' }
-            ]);
-            sourceText = result.response.text();
+        if (mimetype === 'application/pdf') {
+            const data = await pdfParse(fileBuffer);
+            textExtracted = data.text;
+        } else if (mimetype === 'text/plain') {
+            textExtracted = fileBuffer.toString('utf-8');
         } else {
-            console.log('🖼️  Procesando imagen...');
-            const { data, mimeType } = await archivoABase64(tmpPath, req.file.mimetype);
-            const result = await modelTexto.generateContent([
-                { inlineData: { data, mimeType } },
-                { text: 'Extrae y devuelve TODO el texto visible en esta imagen tal como aparece, sin resumir ni modificar nada.' }
-            ]);
-            sourceText = result.response.text();
+            return res.status(400).json({ error: 'Formato no soportado (solo PDF y TXT).' });
         }
 
-        if (!sourceText || sourceText.trim().length < 20) {
-            throw new Error('No se pudo extraer texto del archivo. Asegúrate de que sea legible.');
-        }
-
-        const resultado = await procesarConIA(sourceText);
-        res.json(resultado);
-
+        const prompt = `Actúa como tutor. Analiza este contenido y responde SOLO en JSON con "titulo", "resumen" y un "quiz" de 3 preguntas con "p", "o" (arreglo de 3) y "r" (índice 0-2).\n\nContenido: ${textExtracted.substring(0, 30000)}`;
+        
+        const result = await modelTexto.generateContent(prompt);
+        const data = JSON.parse(result.response.text().match(/\{[\s\S]*\}/)[0]);
+        data.contexto = textExtracted.substring(0, 15000);
+        
+        res.json(data);
     } catch (error) {
-        console.error('Error en /api/estudiar-archivo:', error.message);
         res.status(500).json({ error: error.message });
     } finally {
         if (tmpPath) await unlink(tmpPath).catch(() => {});
     }
 });
 
-// ── POST /api/chat
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
-        if (!context || !question) {
-            return res.status(400).json({ error: "Faltan los campos 'context' y/o 'question'." });
-        }
-
-        const prompt = `Eres un tutor amigable para estudiantes de secundaria y preparatoria. Basándote ÚNICAMENTE en el siguiente contexto, responde la pregunta del alumno de forma clara y sencilla. Si la pregunta no tiene relación con el tema, pídele amablemente que se enfoque en el contenido.
-
-Contexto:
-${context}
-
-Pregunta del alumno:
-${question}`;
-
+        const prompt = `Eres un tutor. Usa SOLO el contexto para responder. Contexto: ${context}\n\nPregunta: ${question}`;
         const result = await modelTexto.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
-        console.error('Error en /api/chat:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ── GET /
-app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: '🚀 Tutor Backend activo y funcionando.' });
-});
-
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-    console.log(`   Texto:  ${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}`);
-    console.log(`   Imagen: gemini-2.5-flash-image (Nano Banana)`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor en línea en el puerto ${PORT}`));
