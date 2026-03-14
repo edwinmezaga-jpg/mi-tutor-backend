@@ -1,11 +1,15 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { Innertube, UniversalCache } from 'youtubei.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { readFile, unlink, readdir } from 'fs/promises';
+import { join } from 'path';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
+const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -18,25 +22,13 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash'
+    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
 });
 
-// ── Inicializar YouTube con cliente WEB
-let youtube;
-(async () => {
-    try {
-        youtube = await Innertube.create({
-            client_type: 'WEB',
-            generate_session_locally: true,
-            cache: new UniversalCache(true),
-        });
-        console.log('✅ Innertube (WEB) listo');
-    } catch (e) {
-        console.error('❌ Error iniciando Innertube:', e.message);
-    }
-})();
+// Ruta donde Render guarda el binario de yt-dlp
+const YTDLP = '/opt/render/project/src/yt-dlp';
 
-// ── Extrae el video ID de cualquier formato de URL de YouTube
+// ── Extrae el video ID de cualquier URL de YouTube
 function extraerVideoId(url) {
     const patterns = [
         /youtu\.be\/([^?&\s]+)/,
@@ -51,28 +43,72 @@ function extraerVideoId(url) {
     return null;
 }
 
-// ── Obtiene subtítulos con youtubei.js
+// ── Descarga subtítulos con yt-dlp y devuelve el texto
 async function obtenerSubtitulosYouTube(videoId) {
-    if (!youtube) throw new Error('El cliente de YouTube aún está iniciando, espera unos segundos e intenta de nuevo.');
+    const tmpDir = '/tmp';
+    const tmpBase = join(tmpDir, `sub_${videoId}_${Date.now()}`);
 
-    const info = await youtube.getInfo(videoId);
-    const transcriptData = await info.getTranscript();
+    try {
+        // Intenta español primero, luego inglés, luego automáticos
+        const cmd = `${YTDLP} \
+            --skip-download \
+            --write-subs \
+            --write-auto-subs \
+            --sub-langs "es,es-MX,es-419,en" \
+            --sub-format vtt \
+            --convert-subs vtt \
+            -o "${tmpBase}" \
+            "https://www.youtube.com/watch?v=${videoId}" \
+            2>&1`;
 
-    const segments = transcriptData?.transcript?.content?.body?.initial_segments;
-    if (!segments || segments.length === 0) {
-        throw new Error('Este video no tiene subtítulos disponibles.');
+        console.log(`📺 Descargando subtítulos del video: ${videoId}`);
+        await execAsync(cmd, { timeout: 30000 });
+
+        // Buscar el archivo .vtt que se generó
+        const files = await readdir(tmpDir);
+        const vttFile = files.find(f => f.startsWith(`sub_${videoId}`) && f.endsWith('.vtt'));
+
+        if (!vttFile) {
+            throw new Error('No se encontraron subtítulos para este video.');
+        }
+
+        const fullPath = join(tmpDir, vttFile);
+        const vttContent = await readFile(fullPath, 'utf8');
+
+        // Limpiar archivo temporal
+        await unlink(fullPath).catch(() => {});
+
+        // Parsear el VTT y extraer solo el texto
+        const texto = vttContent
+            .split('\n')
+            .filter(line =>
+                line.trim() &&
+                !line.startsWith('WEBVTT') &&
+                !line.startsWith('NOTE') &&
+                !line.match(/^\d{2}:\d{2}/) && // timestamps
+                !line.match(/^[\d]+$/)           // números de índice
+            )
+            .map(line => line.replace(/<[^>]+>/g, '').trim()) // quitar tags HTML
+            .filter(line => line.length > 0)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!texto) throw new Error('Los subtítulos estaban vacíos.');
+
+        console.log(`✅ Subtítulos extraídos: ${texto.length} caracteres`);
+        return texto;
+
+    } catch (e) {
+        // Limpiar archivos temporales en caso de error
+        try {
+            const files = await readdir(tmpDir);
+            const tmpFiles = files.filter(f => f.startsWith(`sub_${videoId}`));
+            await Promise.all(tmpFiles.map(f => unlink(join(tmpDir, f)).catch(() => {})));
+        } catch {}
+
+        throw new Error(`No se pudieron obtener los subtítulos: ${e.message}`);
     }
-
-    const texto = segments
-        .map(s => s?.snippet?.text || '')
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    if (!texto) throw new Error('Los subtítulos estaban vacíos.');
-
-    console.log(`✅ Subtítulos extraídos: ${texto.length} caracteres`);
-    return texto;
 }
 
 // ── Decide si es YouTube o texto directo
@@ -83,7 +119,6 @@ async function obtenerTexto(input) {
     const videoId = extraerVideoId(input);
     if (!videoId) throw new Error('No se pudo leer el ID del video. Verifica el link.');
 
-    console.log(`📺 Procesando video: ${videoId}`);
     return await obtenerSubtitulosYouTube(videoId);
 }
 
@@ -156,5 +191,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-2.0-flash'}`);
+    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}`);
 });
