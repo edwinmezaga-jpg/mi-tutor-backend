@@ -165,46 +165,4 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-// ── Podcast ElevenLabs
-app.post('/api/podcast', async (req, res) => {
-    try {
-        const { texto } = req.body;
-        if (!texto) return res.status(400).json({ error: "Falta el texto." });
-        if (!process.env.ELEVENLABS_API_KEY)
-            return res.status(500).json({ error: "Falta ELEVENLABS_API_KEY." });
-
-        const textoLimpio = texto
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .substring(0, 2500);
-
-        const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
-
-        const response = await axios.post(
-            `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-            {
-                text: textoLimpio,
-                model_id: 'eleven_multilingual_v2',
-                voice_settings: { stability: 0.45, similarity_boost: 0.80, style: 0.3 }
-            },
-            {
-                headers: {
-                    'xi-api-key': process.env.ELEVENLABS_API_KEY,
-                    'Content-Type': 'application/json',
-                    'Accept': 'audio/mpeg'
-                },
-                responseType: 'arraybuffer',
-                timeout: 30000
-            }
-        );
-
-        res.set('Content-Type', 'audio/mpeg');
-        res.send(Buffer.from(response.data));
-    } catch (e) {
-        const msg = e.response?.data ? Buffer.from(e.response.data).toString() : e.message;
-        res.status(500).json({ error: msg });
-    }
-});
-
 app.listen(PORT, () => console.log(`🚀 Tutor IA activo en puerto ${PORT} — modelo: ${GROQ_MODEL}`));
