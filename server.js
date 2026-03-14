@@ -22,7 +22,6 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// 💡 OBLIGAMOS a la IA a responder siempre en formato JSON perfecto
 const model = genAI.getGenerativeModel({ 
     model: 'gemini-2.5-flash',
     generationConfig: { responseMimeType: "application/json" } 
@@ -30,7 +29,7 @@ const model = genAI.getGenerativeModel({
 
 const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
 
-// ── 🌐 Lector Web Rápido con "Disfraz"
+// ── 🌐 Lector Web
 async function extraerTextoWeb(url) {
     try {
         const response = await axios.get(url, { 
@@ -57,7 +56,7 @@ async function extraerTextoWeb(url) {
     }
 }
 
-// ── Procesador de IA Ultrarrápido (Ahora con Flashcards)
+// ── Procesador de IA
 async function procesarConIA(sourceText) {
     if (!sourceText || sourceText.length < 50) {
         throw new Error("No se encontró suficiente texto en el enlace o documento para analizar.");
@@ -67,33 +66,41 @@ async function procesarConIA(sourceText) {
     Actúa como un tutor experto. Crea una clase detallada y didáctica.
     Usa etiquetas HTML como <br> para separar párrafos y <b> para negritas.
     
-    Estructura JSON solicitada:
+    Estructura JSON EXACTA (devuelve SOLO el JSON, sin nada más):
     {
-      "titulo": "Título de la clase",
-      "resumen": "Clase magistral profunda y bien explicada",
-      "flashcards": [
-        {"anverso": "Concepto Clave 1", "reverso": "Definición corta y fácil de recordar"},
-        {"anverso": "Concepto Clave 2", "reverso": "Definición corta y fácil de recordar"},
-        {"anverso": "Concepto Clave 3", "reverso": "Definición corta y fácil de recordar"}
-      ],
+      "titulo": "Título claro de la clase",
+      "resumen": "Clase magistral profunda, bien explicada, con formato HTML usando <b> y <br>",
       "quiz": [
-        {"p": "Pregunta 1", "o": ["A", "B", "C"], "r": 0},
-        {"p": "Pregunta 2", "o": ["A", "B", "C"], "r": 1},
-        {"p": "Pregunta 3", "o": ["A", "B", "C"], "r": 2}
+        {"p": "Pregunta 1", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
+        {"p": "Pregunta 2", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
+        {"p": "Pregunta 3", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
+        {"p": "Pregunta 4", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
+        {"p": "Pregunta 5", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0}
+      ],
+      "flashcards": [
+        {"anverso": "Concepto clave 1", "reverso": "Definición o explicación corta del concepto 1"},
+        {"anverso": "Concepto clave 2", "reverso": "Definición o explicación corta del concepto 2"},
+        {"anverso": "Concepto clave 3", "reverso": "Definición o explicación corta del concepto 3"},
+        {"anverso": "Concepto clave 4", "reverso": "Definición o explicación corta del concepto 4"},
+        {"anverso": "Concepto clave 5", "reverso": "Definición o explicación corta del concepto 5"}
       ]
     }
+
+    REGLAS:
+    - El quiz debe tener EXACTAMENTE 5 preguntas con 4 opciones cada una.
+    - Las flashcards deben tener los 5 conceptos más importantes del texto.
+    - El campo "r" del quiz es el índice (0-3) de la respuesta correcta dentro del array "o".
+    
     Contenido a enseñar: ${sourceText.substring(0, 35000)}`;
 
     const result = await model.generateContent(prompt);
-    
-    // Como activamos JSON nativo, podemos parsearlo directamente sin miedo
     const data = JSON.parse(result.response.text());
-    data.contexto = sourceText.substring(0, 10000); 
+    data.contexto = sourceText.substring(0, 10000);
     
     return data;
 }
 
-// ── RUTAS PRINCIPALES ──
+// ── RUTAS
 
 app.post('/api/estudiar', async (req, res) => {
     try {
@@ -120,7 +127,6 @@ app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => 
         const fileBuffer = await readFile(tmpPath);
         let sourceText = '';
 
-        // Leemos el PDF localmente y rapidísimo
         if (req.file.mimetype === 'application/pdf') {
             const data = await pdfParse(fileBuffer);
             sourceText = data.text;
@@ -148,4 +154,4 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor Ultrarrápido activo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Tutor IA activo en puerto ${PORT}`));
