@@ -23,13 +23,13 @@ if (!process.env.GEMINI_API_KEY_IMAGEN) {
     console.warn("⚠️  FALTA GEMINI_API_KEY_IMAGEN — las imágenes no se generarán");
 }
 
-// ── Cliente texto: gemini-2.5-flash
+// ── Cliente texto
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const modelTexto = genAI.getGenerativeModel({
     model: process.env.GEMINI_MODEL || 'gemini-2.5-flash'
 });
 
-// ── Cliente imagen: gemini-2.5-flash-image
+// ── Cliente imagen
 const genAIImagen = new GoogleGenerativeAI(
     process.env.GEMINI_API_KEY_IMAGEN || process.env.GEMINI_API_KEY || ''
 );
@@ -38,14 +38,13 @@ const modelImagen = genAIImagen.getGenerativeModel({
     generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
 });
 
-// ── Multer — archivos temporales
 const upload = multer({
     dest: '/tmp/',
     limits: { fileSize: 20 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
         if (allowed.includes(file.mimetype)) cb(null, true);
-        else cb(new Error('Solo se permiten imágenes (JPG, PNG, WEBP) o PDF.'));
+        else cb(new Error('Solo se permiten imágenes o PDF.'));
     }
 });
 
@@ -54,11 +53,21 @@ async function archivoABase64(path, mimetype) {
     return { data: buffer.toString('base64'), mimeType: mimetype };
 }
 
-// ── 🌐 NUEVO: Lector REAL de Sitios Web y PDFs (Scraper)
+// ── 🌐 Lector REAL de Sitios Web con "Disfraz Humano"
 async function extraerTextoWeb(url) {
     try {
-        console.log(`🌐 Descargando contenido real de: ${url}`);
-        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        console.log(`🌐 Descargando contenido de: ${url}`);
+        
+        // El disfraz de Google Chrome para que Wikipedia y otros no nos bloqueen
+        const response = await axios.get(url, { 
+            responseType: 'arraybuffer',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+            }
+        });
+        
         const contentType = response.headers['content-type'] || '';
 
         if (contentType.includes('application/pdf')) {
@@ -67,20 +76,17 @@ async function extraerTextoWeb(url) {
         } else if (contentType.includes('text/html')) {
             const html = response.data.toString('utf-8');
             const $ = cheerio.load(html);
-            // Quitamos basura visual de la página
             $('script, style, nav, footer, aside, header, noscript').remove();
-            // Extraemos solo el texto de los párrafos y títulos
             return $('h1, h2, h3, p, li, article, section').text().replace(/\s+/g, ' ').trim();
         } else {
             return response.data.toString('utf-8');
         }
     } catch (error) {
         console.error("Error al extraer texto web:", error.message);
-        throw new Error("No se pudo leer la página web. Intenta copiar y pegar el texto en lugar del link.");
+        throw new Error(`El sitio web bloqueó la lectura o no existe. Detalle: ${error.message}`);
     }
 }
 
-// Intercepta si es un link o es texto normal
 async function procesarEntrada(input) {
     const texto = input.trim();
     if (texto.startsWith('http://') || texto.startsWith('https://')) {
@@ -89,7 +95,6 @@ async function procesarEntrada(input) {
     return texto;
 }
 
-// ── Genera imagen educativa
 async function generarImagenExplicativa(titulo, resumen) {
     try {
         const prompt = `Crea una ilustración educativa, colorida y clara sobre el tema: "${titulo}". 
@@ -98,14 +103,8 @@ diagramas simples, iconos, flechas explicativas, colores vivos.
 Basado en: ${resumen.substring(0, 300)}`;
 
         const result = await modelImagen.generateContent(prompt);
-
         for (const part of result.response.candidates[0].content.parts) {
-            if (part.inlineData) {
-                return {
-                    data: part.inlineData.data,
-                    mimeType: part.inlineData.mimeType
-                };
-            }
+            if (part.inlineData) return { data: part.inlineData.data, mimeType: part.inlineData.mimeType };
         }
         return null;
     } catch (e) {
@@ -114,8 +113,11 @@ Basado en: ${resumen.substring(0, 300)}`;
     }
 }
 
-// ── Función central con el texto REAL extraído
 async function procesarConIA(sourceText) {
+    if (!sourceText || sourceText.length < 20) {
+        throw new Error("El texto extraído es demasiado corto o está vacío.");
+    }
+
     const prompt = `Actúa como un tutor experto para estudiantes de secundaria y preparatoria.
 Analiza el siguiente contenido y responde ÚNICAMENTE con un JSON válido, sin texto extra antes ni después, sin bloques de código markdown:
 {
@@ -139,26 +141,23 @@ Contenido REAL a analizar: ${sourceText.substring(0, 30000)}`;
     const data = JSON.parse(jsonMatch[0]);
     data.contexto = sourceText.substring(0, 8000);
 
-    console.log('🎨 Generando imagen con Nano Banana...');
+    console.log('🎨 Generando imagen...');
     const imagen = await generarImagenExplicativa(data.titulo, data.resumen);
     if (imagen) {
         data.imagen = `data:${imagen.mimeType};base64,${imagen.data}`;
-        console.log('✅ Imagen generada correctamente');
     }
 
     return data;
 }
 
-// ── POST /api/estudiar
 app.post('/api/estudiar', async (req, res) => {
     try {
         const { input } = req.body;
         if (!input) return res.status(400).json({ error: "Falta el campo 'input'." });
         
-        // 🔴 AQUÍ OCURRE LA MAGIA: Tu servidor va a la página web y extrae el texto antes de llamar a Gemini
         const textoRealExtraido = await procesarEntrada(input);
-        
         const resultado = await procesarConIA(textoRealExtraido);
+        
         res.json(resultado);
     } catch (error) {
         console.error('Error en /api/estudiar:', error.message);
@@ -166,57 +165,41 @@ app.post('/api/estudiar', async (req, res) => {
     }
 });
 
-// ── POST /api/estudiar-archivo (Intacto)
 app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => {
     const tmpPath = req.file?.path;
     try {
-        if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo.' });
-
+        if (!req.file) return res.status(400).json({ error: 'No se recibió archivo.' });
         let sourceText = '';
 
         if (req.file.mimetype === 'application/pdf') {
-            console.log('📄 Procesando PDF...');
             const { data, mimeType } = await archivoABase64(tmpPath, 'application/pdf');
             const result = await modelTexto.generateContent([
                 { inlineData: { data, mimeType } },
-                { text: 'Extrae y devuelve TODO el texto de este PDF tal como aparece, sin resumir ni modificar nada.' }
+                { text: 'Extrae TODO el texto de este PDF.' }
             ]);
             sourceText = result.response.text();
         } else {
-            console.log('🖼️  Procesando imagen...');
             const { data, mimeType } = await archivoABase64(tmpPath, req.file.mimetype);
             const result = await modelTexto.generateContent([
                 { inlineData: { data, mimeType } },
-                { text: 'Extrae y devuelve TODO el texto visible en esta imagen tal como aparece, sin resumir ni modificar nada.' }
+                { text: 'Extrae TODO el texto visible en esta imagen.' }
             ]);
             sourceText = result.response.text();
-        }
-
-        if (!sourceText || sourceText.trim().length < 20) {
-            throw new Error('No se pudo extraer texto del archivo.');
         }
 
         const resultado = await procesarConIA(sourceText);
         res.json(resultado);
-
     } catch (error) {
-        console.error('Error en /api/estudiar-archivo:', error.message);
         res.status(500).json({ error: error.message });
     } finally {
         if (tmpPath) await unlink(tmpPath).catch(() => {});
     }
 });
 
-// ── POST /api/chat
 app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
-        if (!context || !question) return res.status(400).json({ error: "Faltan campos." });
-
-        const prompt = `Eres un tutor amigable. Basándote ÚNICAMENTE en este contexto, responde:
-Contexto: ${context}
-Pregunta: ${question}`;
-
+        const prompt = `Contexto: ${context}\nPregunta: ${question}`;
         const result = await modelTexto.generateContent(prompt);
         res.json({ answer: result.response.text() });
     } catch (error) {
@@ -224,6 +207,4 @@ Pregunta: ${question}`;
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor en línea en el puerto ${PORT}`));
