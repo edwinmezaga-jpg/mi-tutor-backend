@@ -154,4 +154,52 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
+// ── 🎙️ Podcast con ElevenLabs
+app.post('/api/podcast', async (req, res) => {
+    try {
+        const { texto } = req.body;
+        if (!texto) return res.status(400).json({ error: "Falta el texto." });
+
+        if (!process.env.ELEVENLABS_API_KEY) {
+            return res.status(500).json({ error: "Falta ELEVENLABS_API_KEY en el servidor." });
+        }
+
+        // Limpiamos HTML tags y limitamos a 2500 caracteres (free tier)
+        const textoLimpio = texto
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .substring(0, 2500);
+
+        // Voz "Rachel" en español — natural y clara
+        const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+
+        const response = await axios.post(
+            `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
+            {
+                text: textoLimpio,
+                model_id: 'eleven_multilingual_v2',
+                voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+            },
+            {
+                headers: {
+                    'xi-api-key': process.env.ELEVENLABS_API_KEY,
+                    'Content-Type': 'application/json',
+                    'Accept': 'audio/mpeg'
+                },
+                responseType: 'arraybuffer'
+            }
+        );
+
+        res.set('Content-Type', 'audio/mpeg');
+        res.send(Buffer.from(response.data));
+
+    } catch (error) {
+        const msg = error.response?.data
+            ? Buffer.from(error.response.data).toString()
+            : error.message;
+        res.status(500).json({ error: msg });
+    }
+});
+
 app.listen(PORT, () => console.log(`🚀 Servidor Tutor IA activo en puerto ${PORT}`));
