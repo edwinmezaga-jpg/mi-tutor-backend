@@ -18,10 +18,10 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest'
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash'
 });
 
-// ── Inicializar YouTube UNA sola vez con cliente WEB (el más estable en 2026)
+// ── Inicializar YouTube con cliente WEB
 let youtube;
 (async () => {
     try {
@@ -51,13 +51,11 @@ function extraerVideoId(url) {
     return null;
 }
 
-// ── Obtiene subtítulos con youtubei.js cliente WEB
+// ── Obtiene subtítulos con youtubei.js
 async function obtenerSubtitulosYouTube(videoId) {
     if (!youtube) throw new Error('El cliente de YouTube aún está iniciando, espera unos segundos e intenta de nuevo.');
 
-    // getBasicInfo es más ligero y menos bloqueado que getInfo
-    const info = await youtube.getBasicInfo(videoId, 'WEB');
-
+    const info = await youtube.getInfo(videoId);
     const transcriptData = await info.getTranscript();
 
     const segments = transcriptData?.transcript?.content?.body?.initial_segments;
@@ -158,5 +156,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Servidor en línea en el puerto ${PORT}`);
-    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest'}`);
+    console.log(`   Modelo: ${process.env.GEMINI_MODEL || 'gemini-2.0-flash'}`);
 });
