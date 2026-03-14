@@ -103,11 +103,12 @@ Devuelve EXACTAMENTE este JSON sin texto extra:
     {"p": "Pregunta 5 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0}
   ],
   "flashcards": [
-    {"anverso": "Concepto clave 1", "reverso": "Definición completa y clara del concepto 1"},
-    {"anverso": "Concepto clave 2", "reverso": "Definición completa y clara del concepto 2"},
-    {"anverso": "Concepto clave 3", "reverso": "Definición completa y clara del concepto 3"},
-    {"anverso": "Concepto clave 4", "reverso": "Definición completa y clara del concepto 4"},
-    {"anverso": "Concepto clave 5", "reverso": "Definición completa y clara del concepto 5"}
+    {"anverso": "Concepto clave 1", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
+    {"anverso": "Concepto clave 2", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
+    {"anverso": "Concepto clave 3", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
+    {"anverso": "Concepto clave 4", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
+    {"anverso": "Concepto clave 5", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
+    {"anverso": "Concepto clave 6", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."}
   ]
 }
 
