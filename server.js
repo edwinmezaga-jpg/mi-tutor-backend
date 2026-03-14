@@ -82,30 +82,36 @@ async function procesarConIA(sourceText) {
         },
         {
             role: 'user',
-            content: `Crea una clase didáctica en español sobre el siguiente contenido.
-Usa <br> para saltos de párrafo y <b> para conceptos importantes en el resumen.
+            content: `Eres un profesor universitario experto. Crea una clase magistral COMPLETA y MUY DETALLADA en español sobre el siguiente contenido.
 
-Devuelve EXACTAMENTE este JSON:
+INSTRUCCIONES PARA EL RESUMEN:
+- Mínimo 5 párrafos largos y bien desarrollados
+- Explica cada concepto con profundidad, ejemplos y contexto
+- Usa <br><br> entre párrafos y <b>negritas</b> para conceptos clave
+- No hagas listas, escribe como una clase magistral fluida
+- El alumno debe quedar con una comprensión profunda del tema
+
+Devuelve EXACTAMENTE este JSON sin texto extra:
 {
-  "titulo": "Título claro de la clase",
-  "resumen": "Clase magistral completa con <b>negritas</b> y <br> para párrafos",
+  "titulo": "Título específico y descriptivo de la clase",
+  "resumen": "Clase magistral muy detallada con mínimo 5 párrafos usando <b>negritas</b> y <br><br> entre párrafos",
   "quiz": [
-    {"p": "Pregunta 1", "o": ["A", "B", "C", "D"], "r": 0},
-    {"p": "Pregunta 2", "o": ["A", "B", "C", "D"], "r": 1},
-    {"p": "Pregunta 3", "o": ["A", "B", "C", "D"], "r": 2},
-    {"p": "Pregunta 4", "o": ["A", "B", "C", "D"], "r": 3},
-    {"p": "Pregunta 5", "o": ["A", "B", "C", "D"], "r": 0}
+    {"p": "Pregunta 1 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0},
+    {"p": "Pregunta 2 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 1},
+    {"p": "Pregunta 3 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 2},
+    {"p": "Pregunta 4 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 3},
+    {"p": "Pregunta 5 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0}
   ],
   "flashcards": [
-    {"anverso": "Concepto 1", "reverso": "Definición 1"},
-    {"anverso": "Concepto 2", "reverso": "Definición 2"},
-    {"anverso": "Concepto 3", "reverso": "Definición 3"},
-    {"anverso": "Concepto 4", "reverso": "Definición 4"},
-    {"anverso": "Concepto 5", "reverso": "Definición 5"}
+    {"anverso": "Concepto clave 1", "reverso": "Definición completa y clara del concepto 1"},
+    {"anverso": "Concepto clave 2", "reverso": "Definición completa y clara del concepto 2"},
+    {"anverso": "Concepto clave 3", "reverso": "Definición completa y clara del concepto 3"},
+    {"anverso": "Concepto clave 4", "reverso": "Definición completa y clara del concepto 4"},
+    {"anverso": "Concepto clave 5", "reverso": "Definición completa y clara del concepto 5"}
   ]
 }
 
-Contenido: ${sourceText.substring(0, 28000)}`
+Contenido a enseñar: ${sourceText.substring(0, 28000)}`
         }
     ];
 
