@@ -21,16 +21,22 @@ const model = genAI.getGenerativeModel({
     model: process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest'
 });
 
-// Inicializar YouTube una sola vez al arrancar el servidor
+// ── Inicializar YouTube UNA sola vez con cliente WEB (el más estable en 2026)
 let youtube;
 (async () => {
-    youtube = await Innertube.create({
-        cache: new UniversalCache(true)
-    });
-    console.log('✅ Innertube listo');
+    try {
+        youtube = await Innertube.create({
+            client_type: 'WEB',
+            generate_session_locally: true,
+            cache: new UniversalCache(true),
+        });
+        console.log('✅ Innertube (WEB) listo');
+    } catch (e) {
+        console.error('❌ Error iniciando Innertube:', e.message);
+    }
 })();
 
-// ── Saca el video ID de cualquier formato de URL de YouTube
+// ── Extrae el video ID de cualquier formato de URL de YouTube
 function extraerVideoId(url) {
     const patterns = [
         /youtu\.be\/([^?&\s]+)/,
@@ -45,11 +51,13 @@ function extraerVideoId(url) {
     return null;
 }
 
-// ── Obtiene subtítulos con youtubei.js
+// ── Obtiene subtítulos con youtubei.js cliente WEB
 async function obtenerSubtitulosYouTube(videoId) {
-    if (!youtube) throw new Error('El cliente de YouTube aún está iniciando, intenta en unos segundos.');
+    if (!youtube) throw new Error('El cliente de YouTube aún está iniciando, espera unos segundos e intenta de nuevo.');
 
-    const info = await youtube.getInfo(videoId);
+    // getBasicInfo es más ligero y menos bloqueado que getInfo
+    const info = await youtube.getBasicInfo(videoId, 'WEB');
+
     const transcriptData = await info.getTranscript();
 
     const segments = transcriptData?.transcript?.content?.body?.initial_segments;
@@ -64,6 +72,8 @@ async function obtenerSubtitulosYouTube(videoId) {
         .trim();
 
     if (!texto) throw new Error('Los subtítulos estaban vacíos.');
+
+    console.log(`✅ Subtítulos extraídos: ${texto.length} caracteres`);
     return texto;
 }
 
