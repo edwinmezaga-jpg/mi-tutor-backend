@@ -416,45 +416,50 @@ app.get('/api/maestro/grupos', verifyToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Dashboard de un grupo — ver todas las sesiones
+// Agregar grupos con código de invitación adicional
+app.post('/api/maestro/agregar-grupo', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { codigoInvitacion } = req.body;
+        if (!codigoInvitacion) return res.status(400).json({ error: 'Falta el código.' });
+        const inv = await Invitacion.findOne({ codigo: codigoInvitacion, usada: false });
+        if (!inv) return res.status(403).json({ error: 'Código inválido o ya usado.' });
+        const gruposCreados = [];
+        for (const g of (inv.grupos || [])) {
+            if (!SEMESTRES.includes(g.semestre) || !MATERIAS.includes(g.materia)) continue;
+            const existe = await Grupo.findOne({ maestroId: req.maestro.id, semestre: g.semestre, materia: g.materia });
+            if (existe) continue;
+            const shortId = await shortIdUnico(Grupo);
+            const grupo = await Grupo.create({ shortId, nombre: `${g.materia} — ${g.semestre}`, semestre: g.semestre, materia: g.materia, maestroId: req.maestro.id });
+            gruposCreados.push(grupo);
+        }
+        inv.usada = true; inv.maestroId = req.maestro.id; await inv.save();
+        res.json({ grupos: gruposCreados });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Dashboard de un grupo — incluye sesiones para detalle por alumno
 app.get('/api/maestro/grupo/:grupoId', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        // Verificar que el grupo pertenece al maestro
         const grupo = await Grupo.findOne({ _id: req.params.grupoId, maestroId: req.maestro.id });
         if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
-
         const sesiones = await Sesion.find({ grupoId: req.params.grupoId })
-            .sort({ creadoEn: -1 })
-            .select('-__v -chatMensajes');
-
-        // Estadísticas
+            .sort({ creadoEn: -1 }).select('-__v -chatMensajes');
         const total = sesiones.length;
         const promedio = total ? Math.round(sesiones.reduce((a,s) => a+(s.pct||0), 0) / total) : 0;
-
-        // Preguntas más falladas
         const fallos = {};
+        sesiones.forEach(s => { (s.respuestasQuiz||[]).forEach(r => { if (!r.esCorrecta) fallos[r.pregunta] = (fallos[r.pregunta]||0) + 1; }); });
+        const preguntasMasFalladas = Object.entries(fallos).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([pregunta,veces])=>({pregunta,veces}));
+        const alumnosMap = {};
         sesiones.forEach(s => {
-            (s.respuestasQuiz||[]).forEach(r => {
-                if (!r.esCorrecta) fallos[r.pregunta] = (fallos[r.pregunta]||0) + 1;
-            });
+            if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = { nombre: s.nombre, sesiones: 0, pctTotal: 0 };
+            alumnosMap[s.nombre].sesiones++;
+            alumnosMap[s.nombre].pctTotal += (s.pct||0);
         });
-        const preguntasMasFalladas = Object.entries(fallos)
-            .sort((a,b) => b[1]-a[1]).slice(0,5)
-            .map(([pregunta, veces]) => ({ pregunta, veces }));
-
-        // Alumnos únicos
-        const alumnos = {};
-        sesiones.forEach(s => {
-            if (!alumnos[s.nombre]) alumnos[s.nombre] = { nombre: s.nombre, sesiones: 0, pctPromedio: 0, ultima: s.fecha };
-            alumnos[s.nombre].sesiones++;
-            alumnos[s.nombre].pctPromedio = Math.round(
-                (alumnos[s.nombre].pctPromedio * (alumnos[s.nombre].sesiones-1) + (s.pct||0)) / alumnos[s.nombre].sesiones
-            );
-        });
-
-        res.json({ grupo, total, promedio, preguntasMasFalladas, alumnos: Object.values(alumnos), sesiones });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const alumnos = Object.values(alumnosMap).map(a => ({ ...a, pctPromedio: Math.round(a.pctTotal / a.sesiones) }));
+        res.json({ grupo, total, promedio, preguntasMasFalladas, alumnos, sesiones });
+    } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ PANEL ADMIN ══
