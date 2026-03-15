@@ -54,6 +54,36 @@ const claseSchema = new mongoose.Schema({
 });
 
 const Comprobante = mongoose.models.Comprobante || mongoose.model('Comprobante', comprobanteSchema);
+
+// Esquema de Sesión completa (reporte del alumno)
+const sesionSchema = new mongoose.Schema({
+    shortId:    { type: String, unique: true, index: true },
+    nombre:     String,
+    titulo:     String,
+    fecha:      String,
+    hora:       String,
+    // Actividad
+    escuchoPodcast: { type: Boolean, default: false },
+    tarjetasAbiertas: [Number],           // índices de tarjetas que abrió
+    respuestasQuiz: [{                    // una entrada por pregunta
+        pregunta:   String,
+        opciones:   [String],
+        seleccionada: Number,
+        correcta:   Number,
+        esCorrecta: Boolean
+    }],
+    chatMensajes: [{                      // conversación completa
+        role: String,                     // 'user' o 'ai'
+        texto: String,
+        hora: String
+    }],
+    correctas:  Number,
+    total:      Number,
+    pct:        Number,
+    codigo:     String,
+    creadoEn:   { type: Date, default: Date.now }
+});
+const Sesion = mongoose.models.Sesion || mongoose.model('Sesion', sesionSchema);
 const Clase = mongoose.models.Clase || mongoose.model('Clase', claseSchema);
 
 // ── Generar ID corto único (6 caracteres alfanuméricos)
@@ -292,6 +322,44 @@ app.get('/api/dashboard/:grupo', async (req, res) => {
             .sort({ creadoEn: -1 })
             .select('-__v');
         res.json({ grupo: req.params.grupo, total: comprobantes.length, comprobantes });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ENDPOINTS SESIÓN ══
+
+// Guardar sesión completa del alumno
+app.post('/api/sesion', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState)
+            return res.status(503).json({ error: 'Base de datos no disponible.' });
+
+        const { nombre, titulo, fecha, hora, escuchoPodcast, tarjetasAbiertas,
+                respuestasQuiz, chatMensajes, correctas, total, pct, codigo } = req.body;
+        if (!nombre || !titulo) return res.status(400).json({ error: 'Faltan datos.' });
+
+        const shortId = await shortIdUnico(Sesion);
+        await Sesion.create({
+            shortId, nombre, titulo, fecha, hora,
+            escuchoPodcast: escuchoPodcast || false,
+            tarjetasAbiertas: tarjetasAbiertas || [],
+            respuestasQuiz: respuestasQuiz || [],
+            chatMensajes: chatMensajes || [],
+            correctas, total, pct, codigo
+        });
+
+        res.json({ shortId, url: `/sesion/${shortId}` });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Obtener sesión por shortId
+app.get('/api/sesion/:shortId', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState)
+            return res.status(503).json({ error: 'Base de datos no disponible.' });
+
+        const sesion = await Sesion.findOne({ shortId: req.params.shortId });
+        if (!sesion) return res.status(404).json({ error: 'Sesión no encontrada.' });
+        res.json(sesion);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
