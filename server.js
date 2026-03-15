@@ -497,6 +497,9 @@ app.get('/api/admin/sesiones', verifyAdmin, async (req, res) => {
         res.json({ sesiones, grupos });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// Generar código de invitación único
+function generarCodigoInvitacion(nombre) {
     const iniciales = nombre.split(' ').map(w=>w[0]||'').join('').toUpperCase().substring(0,4);
     const rand = Math.random().toString(36).substring(2,6).toUpperCase();
     return `INV-${iniciales}-${rand}`;
