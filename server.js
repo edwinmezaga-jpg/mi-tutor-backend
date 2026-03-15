@@ -151,8 +151,13 @@ async function extraerTextoWeb(url) {
         if (ct.includes('application/pdf')) return (await pdfParse(response.data)).text;
         if (ct.includes('text/html')) {
             const $ = cheerio.load(response.data.toString('utf-8'));
-            $('script,style,nav,footer,aside,header').remove();
-            return $('h1,h2,h3,p,li').text().replace(/\s+/g,' ').trim();
+            // Remover todo lo que no es contenido educativo
+            $('script,style,nav,footer,aside,header,iframe,noscript,.ad,.ads,.advertisement,.sidebar,.menu,.navbar,.cookie,.popup,.modal,form,button').remove();
+            // Priorizar el contenido principal
+            const mainContent = $('article, main, .content, .post, .entry, #content, #main, .article-body').text();
+            if (mainContent.trim().length > 200) return mainContent.replace(/\s+/g,' ').trim();
+            // Fallback: headings y párrafos
+            return $('h1,h2,h3,h4,p,li,td,th,blockquote').text().replace(/\s+/g,' ').trim();
         }
         return response.data.toString('utf-8');
     } catch { throw new Error("El sitio bloqueó la lectura. Copia y pega el texto directamente."); }
@@ -250,7 +255,17 @@ app.post('/api/estudiar-archivo', upload.array('archivos', 10), async (req, res)
                     { model: 'meta-llama/llama-4-scout-17b-16e-instruct',
                       messages: [{ role: 'user', content: [
                           { type: 'image_url', image_url: { url: `data:${mime};base64,${buf.toString('base64')}` } },
-                          { type: 'text', text: 'Transcribe todo el texto e información de esta imagen. Sé exhaustivo.' }
+                          { type: 'text', text: `Eres un asistente educativo. Extrae ÚNICAMENTE el contenido educativo relevante de esta imagen.
+
+IGNORA completamente: menús de navegación, botones, publicidad, encabezados de sitios web, pies de página, íconos, imágenes decorativas, redes sociales, precios, nombres de marcas no relevantes, elementos de UI/UX.
+
+EXTRAE y transcribe: títulos y subtítulos del tema, definiciones, conceptos clave, explicaciones, fórmulas, datos históricos, fechas importantes, nombres de personas relevantes al tema, listas de características, procesos o pasos explicados, cualquier contenido que un estudiante necesite aprender.
+
+Si es una foto de apuntes o libro: transcribe el texto completo con precisión.
+Si es una captura de pantalla de un sitio educativo: extrae solo el artículo o lección, ignora el resto.
+Si hay diagramas o tablas: descríbelos con el contenido que muestran.
+
+Responde directamente con el contenido extraído, sin comentarios sobre lo que ignoraste.` }
                       ]}], max_tokens: 4096 },
                     { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
                 );
