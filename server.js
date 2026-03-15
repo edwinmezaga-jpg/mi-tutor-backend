@@ -460,10 +460,10 @@ app.get('/api/maestro/grupo/:grupoId', verifyToken, async (req, res) => {
 // ══ PANEL ADMIN ══
 
 function verifyAdmin(req, res, next) {
-    const pwd   = req.headers['x-admin-password'];
-    const email = req.headers['x-admin-email'];
-    const adminPwd   = process.env.ADMIN_PASSWORD;
-    const adminEmail = process.env.ADMIN_EMAIL;
+    const pwd   = (req.headers['x-admin-password'] || '').trim();
+    const email = (req.headers['x-admin-email'] || '').trim();
+    const adminPwd   = (process.env.ADMIN_PASSWORD || '').trim();
+    const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
     if (!adminPwd || !adminEmail) return res.status(503).json({ error: 'Panel admin no configurado.' });
     if (pwd !== adminPwd || email !== adminEmail) return res.status(401).json({ error: 'Credenciales incorrectas.' });
     next();
