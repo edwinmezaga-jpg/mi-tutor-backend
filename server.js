@@ -100,7 +100,8 @@ Devuelve EXACTAMENTE este JSON sin texto extra:
     {"p": "Pregunta 2 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 1},
     {"p": "Pregunta 3 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 2},
     {"p": "Pregunta 4 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 3},
-    {"p": "Pregunta 5 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0}
+    {"p": "Pregunta 5 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0},
+    {"p": "Pregunta 6 sobre concepto importante", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 1}
   ],
   "flashcards": [
     {"anverso": "Concepto clave 1", "definicion": "Qué es en una oración clara y directa", "contexto": "Cómo se usa, para qué sirve o en qué situación aparece este concepto, con un ejemplo concreto del tema."},
