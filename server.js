@@ -170,36 +170,41 @@ async function procesarConIA(sourceText) {
 
     const messages = [
         { role: 'system', content: 'Eres un tutor experto. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
-        { role: 'user', content: `Eres un profesor universitario experto. Crea una clase magistral COMPLETA y MUY DETALLADA en español.
+        { role: 'user', content: `Eres un profesor de preparatoria experto. Basándote ÚNICAMENTE en el siguiente contenido, crea una clase magistral COMPLETA en español.
 
-INSTRUCCIONES:
-- Mínimo 5 párrafos largos y bien desarrollados
+REGLAS ESTRICTAS:
+- El resumen debe tener mínimo 5 párrafos largos y detallados sobre el tema
 - Usa <br><br> entre párrafos y <b>negritas</b> para conceptos clave
-- No hagas listas, escribe como clase magistral fluida
+- Escribe como clase magistral fluida, sin listas
+- El quiz debe tener exactamente 6 preguntas de opción múltiple con 4 opciones REALES y específicas del tema
+- NUNCA uses letras sueltas (A, B, C, D) como opciones — cada opción debe ser una respuesta completa
+- Las flashcards deben cubrir los 6 conceptos más importantes del tema
+- TODO debe basarse en el contenido proporcionado, no en conocimiento general
 
-JSON EXACTO:
+FORMATO JSON (responde SOLO con este JSON, sin texto adicional):
 {
-  "titulo": "Título específico",
-  "resumen": "Clase magistral con <b>negritas</b> y <br><br> entre párrafos",
+  "titulo": "Título descriptivo del tema estudiado",
+  "resumen": "Clase magistral detallada con <b>conceptos clave</b> en negritas y <br><br> entre párrafos...",
   "quiz": [
-    {"p": "Pregunta 1", "o": ["A", "B", "C", "D"], "r": 0},
-    {"p": "Pregunta 2", "o": ["A", "B", "C", "D"], "r": 1},
-    {"p": "Pregunta 3", "o": ["A", "B", "C", "D"], "r": 2},
-    {"p": "Pregunta 4", "o": ["A", "B", "C", "D"], "r": 3},
-    {"p": "Pregunta 5", "o": ["A", "B", "C", "D"], "r": 0},
-    {"p": "Pregunta 6", "o": ["A", "B", "C", "D"], "r": 1}
+    {"p": "¿Pregunta específica sobre el tema?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0},
+    {"p": "¿Segunda pregunta específica?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 2},
+    {"p": "¿Tercera pregunta específica?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 1},
+    {"p": "¿Cuarta pregunta específica?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 3},
+    {"p": "¿Quinta pregunta específica?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 0},
+    {"p": "¿Sexta pregunta específica?", "o": ["Opción A completa", "Opción B completa", "Opción C completa", "Opción D completa"], "r": 1}
   ],
   "flashcards": [
-    {"anverso": "Concepto 1", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"},
-    {"anverso": "Concepto 2", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"},
-    {"anverso": "Concepto 3", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"},
-    {"anverso": "Concepto 4", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"},
-    {"anverso": "Concepto 5", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"},
-    {"anverso": "Concepto 6", "definicion": "Qué es", "contexto": "Cómo se usa con ejemplo"}
+    {"anverso": "Concepto clave 1", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"},
+    {"anverso": "Concepto clave 2", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"},
+    {"anverso": "Concepto clave 3", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"},
+    {"anverso": "Concepto clave 4", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"},
+    {"anverso": "Concepto clave 5", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"},
+    {"anverso": "Concepto clave 6", "definicion": "Definición clara y precisa en 1-2 oraciones", "contexto": "Ejemplo concreto de cómo se aplica o usa este concepto"}
   ]
 }
 
-Contenido: ${sourceText.substring(0, 28000)}` }
+CONTENIDO A ESTUDIAR:
+${sourceText.substring(0, 28000)}` }
     ];
 
     const text = await groqCall(messages, true);
