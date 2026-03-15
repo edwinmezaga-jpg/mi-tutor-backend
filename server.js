@@ -230,35 +230,43 @@ app.post('/api/estudiar', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/estudiar-archivo', upload.single('archivo'), async (req, res) => {
-    const tmpPath = req.file?.path;
+app.post('/api/estudiar-archivo', upload.array('archivos', 10), async (req, res) => {
+    const archivos = req.files || [];
+    const tmpPaths = archivos.map(f => f.path);
     try {
-        if (!req.file) return res.status(400).json({ error: 'No se recibió archivo.' });
-        const buf = await readFile(tmpPath);
-        const mime = req.file.mimetype;
-        let sourceText = '';
-        if (mime === 'application/pdf') {
-            try { sourceText = (await pdfParse(buf)).text; }
-            catch { throw new Error('No se pudo leer el PDF.'); }
-        } else if (mime.startsWith('image/')) {
-            const response = await axios.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                { model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-                  messages: [{ role: 'user', content: [
-                      { type: 'image_url', image_url: { url: `data:${mime};base64,${buf.toString('base64')}` } },
-                      { type: 'text', text: 'Transcribe todo el texto e información de esta imagen. Sé exhaustivo.' }
-                  ]}], max_tokens: 4096 },
-                { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
-            );
-            sourceText = response.data.choices[0].message.content;
-        } else {
-            sourceText = buf.toString('utf-8');
+        if (!archivos.length) return res.status(400).json({ error: 'No se recibieron archivos.' });
+        let textoTotal = '';
+
+        for (const archivo of archivos) {
+            const buf = await readFile(archivo.path);
+            const mime = archivo.mimetype;
+            let texto = '';
+            if (mime === 'application/pdf') {
+                try { texto = (await pdfParse(buf)).text; }
+                catch { texto = ''; }
+            } else if (mime.startsWith('image/')) {
+                const response = await axios.post(
+                    'https://api.groq.com/openai/v1/chat/completions',
+                    { model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+                      messages: [{ role: 'user', content: [
+                          { type: 'image_url', image_url: { url: `data:${mime};base64,${buf.toString('base64')}` } },
+                          { type: 'text', text: 'Transcribe todo el texto e información de esta imagen. Sé exhaustivo.' }
+                      ]}], max_tokens: 4096 },
+                    { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+                );
+                texto = response.data.choices[0].message.content;
+            } else {
+                texto = buf.toString('utf-8');
+            }
+            if (texto.trim()) textoTotal += texto + '\n\n';
         }
-        if (!sourceText || sourceText.trim().length < 30)
-            throw new Error('No se encontró suficiente texto.');
-        res.json(await procesarConIA(sourceText));
+
+        if (!textoTotal.trim() || textoTotal.trim().length < 30)
+            throw new Error('No se encontró suficiente texto en los archivos.');
+
+        res.json(await procesarConIA(textoTotal));
     } catch (e) { res.status(500).json({ error: e.message }); }
-    finally { if (tmpPath) await unlink(tmpPath).catch(() => {}); }
+    finally { for (const p of tmpPaths) await unlink(p).catch(() => {}); }
 });
 
 app.post('/api/chat', async (req, res) => {
@@ -549,6 +557,56 @@ app.delete('/api/admin/invitacion/:codigo', verifyAdmin, async (req, res) => {
     try {
         await Invitacion.deleteOne({ codigo: req.params.codigo, usada: false });
         res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar maestro completo (cascada: grupos + sesiones)
+app.delete('/api/admin/maestro/:maestroId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { maestroId } = req.params;
+        // Encontrar grupos del maestro
+        const grupos = await Grupo.find({ maestroId });
+        const grupoIds = grupos.map(g => g._id);
+        // Borrar sesiones de esos grupos
+        const sesionesBorradas = grupoIds.length
+            ? (await Sesion.deleteMany({ grupoId: { $in: grupoIds } })).deletedCount : 0;
+        // Borrar grupos
+        const gruposBorrados = (await Grupo.deleteMany({ maestroId })).deletedCount;
+        // Borrar maestro
+        await Maestro.deleteOne({ _id: maestroId });
+        res.json({ gruposBorrados, sesionesBorradas });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar sesiones de un alumno específico
+app.delete('/api/admin/sesiones/alumno', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { nombre } = req.body;
+        if (!nombre) return res.status(400).json({ error: 'Falta el nombre.' });
+        const result = await Sesion.deleteMany({ nombre });
+        res.json({ borradas: result.deletedCount });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar sesiones de un grupo
+app.delete('/api/admin/sesiones/grupo', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { grupoId } = req.body;
+        if (!grupoId) return res.status(400).json({ error: 'Falta el grupoId.' });
+        const result = await Sesion.deleteMany({ grupoId });
+        res.json({ borradas: result.deletedCount });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Depuración completa — borrar todas las sesiones
+app.delete('/api/admin/sesiones/todo', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const result = await Sesion.deleteMany({});
+        res.json({ borradas: result.deletedCount });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
