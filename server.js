@@ -764,7 +764,60 @@ app.get('/api/tarea/:shortId', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Agregar grupos con código de invitación adicional
+// Crear tarea desde archivos (fotos/PDF) — igual que tarea texto pero con upload
+app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10), async (req, res) => {
+    const archivos = req.files || [];
+    const tmpPaths = archivos.map(f => f.path);
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        if (!archivos.length) return res.status(400).json({ error: 'No se recibieron archivos.' });
+
+        const { grupoId } = req.body;
+        let textoTotal = '';
+
+        for (const archivo of archivos) {
+            const buf = await readFile(archivo.path);
+            const mime = archivo.mimetype;
+            let texto = '';
+            if (mime === 'application/pdf') {
+                try { texto = (await pdfParse(buf)).text; } catch { texto = ''; }
+            } else if (mime.startsWith('image/')) {
+                const response = await axios.post(
+                    'https://api.groq.com/openai/v1/chat/completions',
+                    { model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+                      messages: [{ role: 'user', content: [
+                          { type: 'image_url', image_url: { url: `data:${mime};base64,${buf.toString('base64')}` } },
+                          { type: 'text', text: 'Extrae ÚNICAMENTE el contenido educativo de esta imagen. Transcribe texto, fórmulas, datos y conceptos clave. Ignora elementos de UI, menús y publicidad.' }
+                      ]}], max_tokens: 4096 },
+                    { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+                );
+                texto = response.data.choices[0].message.content;
+            } else {
+                texto = buf.toString('utf-8');
+            }
+            if (texto.trim()) textoTotal += texto + '\n\n';
+        }
+
+        if (!textoTotal.trim() || textoTotal.trim().length < 30)
+            throw new Error('No se encontró suficiente texto en los archivos.');
+
+        const generated = await procesarConIAPool(textoTotal);
+        const shortId = await shortIdUnico(Tarea);
+        const tarea = await Tarea.create({
+            shortId,
+            maestroId: req.maestro.id,
+            grupoId:   grupoId || null,
+            titulo:    generated.titulo,
+            abstract:  generated.abstract || '',
+            resumen:   generated.resumen,
+            flashcards: generated.flashcards || [],
+            poolPreguntas: generated.quiz || [],
+            contexto:  textoTotal.substring(0, 10000)
+        });
+        res.json({ shortId: tarea.shortId, titulo: tarea.titulo, abstract: tarea.abstract });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+    finally { for (const p of tmpPaths) await unlink(p).catch(() => {}); }
+});
 app.post('/api/maestro/agregar-grupo', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
