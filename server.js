@@ -471,43 +471,55 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         const { tema } = req.body;
         if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
 
-        // Usar la IA para identificar los mejores recursos y URLs reales de fuentes institucionales
-        const prompt = `Eres un bibliotecario académico experto. El maestro necesita recursos educativos de ALTA CALIDAD en español (o inglés si no hay en español) sobre el tema: "${tema}".
+        const prompt = `Eres un experto en recursos educativos digitales. Un maestro de preparatoria necesita materiales de ALTA CALIDAD sobre: "${tema}".
 
-Busca y proporciona EXACTAMENTE 5 recursos reales de fuentes institucionales confiables. Prioriza:
-1. PDFs de universidades (.edu, .unam.mx, .ipn.mx, etc.)
-2. Khan Academy en español
-3. OpenStax (libros de texto abiertos)
-4. CONEVYT, SEP, o instituciones educativas mexicanas
-5. Enciclopedia Britannica, National Geographic Education
-6. Artículos de Wikipedia con fuentes verificables
-7. Coursera/edX materiales abiertos
+INSTRUCCIONES CLAVE:
 
-FORMATO JSON ESTRICTO (responde SOLO con este JSON):
+1. CALIDAD SOBRE RESTRICCIÓN: El internet es vasto. Busca los mejores recursos disponibles — pueden ser .com, .org, .edu, .net, o cualquier dominio. Lo que importa es que sean contenido serio y confiable, no el dominio.
+
+2. EVALUACIÓN DE ACCESIBILIDAD — Para cada recurso pregúntate: "¿Puede un alumno abrir este link y leer/ver el contenido completo SIN registrarse ni pagar?" 
+   - Si sí → procesable: true
+   - Si no (paywall, login requerido, suscripción) → procesable: false
+   - Videos de YouTube, Vimeo, etc. → procesable: false (son material de apoyo visual)
+
+3. URLS ESPECÍFICAS — NUNCA pongas la homepage de un sitio (ej: britannica.com). Siempre el artículo específico del tema (ej: britannica.com/event/French-Revolution). Si no conoces la URL exacta del artículo, construye una URL probable basada en cómo ese sitio organiza su contenido.
+
+4. PAYWALL CONOCIDOS — Estos SIEMPRE son procesable: false: Coursera, Udemy, edX (cursos de pago), NYT, WSJ, The Economist, Nature (artículos cerrados), CNN, BBC (algunos), Medium (artículos de pago).
+
+5. BALANCE — Busca 4-5 recursos procesables (texto/PDF) y 2-3 videos de apoyo.
+
+FORMATO JSON (responde SOLO con este JSON válido):
 {
   "recursos": [
     {
-      "titulo": "Título real del recurso",
-      "fuente": "Nombre de la institución",
-      "tipo": "PDF" | "Artículo" | "Video" | "Libro" | "Curso",
+      "titulo": "Título descriptivo y específico del recurso",
+      "fuente": "Nombre del sitio o institución",
+      "tipo": "Artículo" | "PDF" | "Libro" | "Video" | "Infografía",
       "nivel": "Preparatoria" | "Universidad" | "General",
-      "descripcion": "1-2 oraciones de qué cubre este recurso",
-      "url": "URL real y verificable del recurso",
-      "idioma": "Español" | "Inglés"
+      "descripcion": "2 oraciones: qué cubre exactamente y por qué es útil para este tema",
+      "url": "https://url-especifica-del-articulo-no-homepage.com/tema-especifico",
+      "idioma": "Español" | "Inglés",
+      "procesable": true,
+      "razon_acceso": "Libre acceso sin registro" | "Paywall/Login requerido" | "Video (solo referencia)"
     }
   ],
-  "consejo": "Una oración de consejo pedagógico sobre cómo usar estos recursos con el grupo."
+  "consejo": "Consejo pedagógico de 1-2 oraciones sobre cómo usar estos recursos con el grupo."
 }
 
-Tema: ${tema}
-IMPORTANTE: Solo URLs reales que probablemente existan. Si no conoces la URL exacta de un recurso, usa la URL de la institución/sección donde se encontraría.`;
+Tema a buscar: "${tema}"`;
 
         const text = await groqCall([
-            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido, sin texto extra.' },
+            { role: 'system', content: 'Eres un experto en recursos educativos digitales. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
             { role: 'user', content: prompt }
         ], true);
 
         const data = JSON.parse(text);
+
+        // Separar en procesables y material extra
+        const recursos = data.recursos || [];
+        data.paraTarea   = recursos.filter(r => r.procesable === true && r.tipo !== 'Video');
+        data.materialExtra = recursos.filter(r => r.procesable === false || r.tipo === 'Video');
+
         res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
