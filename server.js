@@ -95,6 +95,7 @@ const sesionSchema = new mongoose.Schema({
     total:      Number,
     pct:        Number,
     codigo:     String,
+    tareaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Tarea', default: null, index: true },
     creadoEn:   { type: Date, default: Date.now, expires: 60 * 60 * 24 * 180 } // 180 días TTL
 });
 const Sesion = mongoose.models.Sesion || mongoose.model('Sesion', sesionSchema);
@@ -108,6 +109,23 @@ const claseSchema = new mongoose.Schema({
     creadoEn: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 180 }
 });
 const Clase = mongoose.models.Clase || mongoose.model('Clase', claseSchema);
+
+// Tarea asignada por maestro — TTL 180 días
+const tareaSchema = new mongoose.Schema({
+    shortId:   { type: String, unique: true, index: true },
+    maestroId: { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true },
+    grupoId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    titulo:    String,
+    abstract:  String,       // resumen breve generado por IA para la tarjeta
+    resumen:   String,       // clase magistral completa
+    flashcards: [Object],
+    poolPreguntas: [Object], // 15-18 preguntas; alumnos ven 6 random
+    contexto:  String,
+    vistas:    { type: Number, default: 0 },
+    creadoEn:  { type: Date, default: Date.now, expires: 60 * 60 * 24 * 180 }
+});
+const Tarea = mongoose.models.Tarea || mongoose.model('Tarea', tareaSchema);
+
 const Invitacion = mongoose.models.Invitacion || mongoose.model('Invitacion', invitacionSchema);
 
 // ── Helpers
@@ -210,6 +228,67 @@ ${sourceText.substring(0, 28000)}` }
     const text = await groqCall(messages, true);
     const data = JSON.parse(text);
     data.contexto = sourceText.substring(0, 10000);
+    return data;
+}
+
+// ── Procesador IA para Tarea — genera pool de 15 preguntas + abstract
+async function procesarConIAPool(sourceText) {
+    if (!sourceText || sourceText.length < 50)
+        throw new Error("No se encontró suficiente texto para analizar.");
+
+    const messages = [
+        { role: 'system', content: 'Eres un tutor experto. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
+        { role: 'user', content: `Eres un profesor de preparatoria experto. Basándote ÚNICAMENTE en el contenido, crea una clase magistral COMPLETA en español.
+
+REGLAS ESTRICTAS:
+- El resumen debe tener mínimo 5 párrafos largos y detallados sobre el tema
+- Usa <br><br> entre párrafos y <b>negritas</b> para conceptos clave
+- Escribe como clase magistral fluida, sin listas
+- El quiz debe tener EXACTAMENTE 15 preguntas de opción múltiple con 4 opciones REALES y específicas
+- NUNCA uses letras sueltas (A, B, C, D) como opciones — cada opción debe ser una respuesta completa
+- Las preguntas deben cubrir distintos aspectos/niveles del tema (memorización, comprensión, aplicación)
+- Las flashcards deben cubrir los 6 conceptos más importantes
+- El abstract debe ser 2-3 oraciones que expliquen de qué trata el tema y para qué sirve (para el alumno)
+- TODO debe basarse en el contenido proporcionado, no en conocimiento general
+
+FORMATO JSON (responde SOLO con este JSON):
+{
+  "titulo": "Título descriptivo del tema estudiado",
+  "abstract": "2-3 oraciones: de qué trata el tema y por qué es importante para el alumno.",
+  "resumen": "Clase magistral con <b>conceptos clave</b> y <br><br> entre párrafos...",
+  "quiz": [
+    {"p": "¿Pregunta 1?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
+    {"p": "¿Pregunta 2?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
+    {"p": "¿Pregunta 3?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
+    {"p": "¿Pregunta 4?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
+    {"p": "¿Pregunta 5?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
+    {"p": "¿Pregunta 6?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
+    {"p": "¿Pregunta 7?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
+    {"p": "¿Pregunta 8?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
+    {"p": "¿Pregunta 9?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
+    {"p": "¿Pregunta 10?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
+    {"p": "¿Pregunta 11?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
+    {"p": "¿Pregunta 12?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
+    {"p": "¿Pregunta 13?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
+    {"p": "¿Pregunta 14?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
+    {"p": "¿Pregunta 15?", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2}
+  ],
+  "flashcards": [
+    {"anverso": "Concepto 1", "definicion": "Definición", "contexto": "Ejemplo"},
+    {"anverso": "Concepto 2", "definicion": "Definición", "contexto": "Ejemplo"},
+    {"anverso": "Concepto 3", "definicion": "Definición", "contexto": "Ejemplo"},
+    {"anverso": "Concepto 4", "definicion": "Definición", "contexto": "Ejemplo"},
+    {"anverso": "Concepto 5", "definicion": "Definición", "contexto": "Ejemplo"},
+    {"anverso": "Concepto 6", "definicion": "Definición", "contexto": "Ejemplo"}
+  ]
+}
+
+CONTENIDO A ESTUDIAR:
+${sourceText.substring(0, 28000)}` }
+    ];
+
+    const text = await groqCall(messages, true);
+    const data = JSON.parse(text);
     return data;
 }
 
@@ -327,7 +406,7 @@ app.post('/api/sesion', async (req, res) => {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { nombre, grupoId, semestre, materia, titulo, fecha, hora,
                 escuchoPodcast, tarjetasAbiertas, respuestasQuiz, chatMensajes,
-                correctas, total, pct, codigo } = req.body;
+                correctas, total, pct, codigo, tareaId } = req.body;
         if (!nombre || !titulo) return res.status(400).json({ error: 'Faltan datos.' });
 
         let grupoNombre = '';
@@ -344,7 +423,8 @@ app.post('/api/sesion', async (req, res) => {
             tarjetasAbiertas: tarjetasAbiertas || [],
             respuestasQuiz: respuestasQuiz || [],
             chatMensajes: chatMensajes || [],
-            correctas, total, pct, codigo
+            correctas, total, pct, codigo,
+            tareaId: tareaId || null
         });
         res.json({ shortId });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -441,6 +521,101 @@ app.get('/api/maestro/grupos', verifyToken, async (req, res) => {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const grupos = await Grupo.find({ maestroId: req.maestro.id }).sort({ semestre: 1, materia: 1 });
         res.json({ grupos });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ RUTAS DE TAREA ══
+
+// Crear tarea (maestro sube contenido, IA genera clase + pool una sola vez)
+app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { input, grupoId } = req.body;
+        if (!input) return res.status(400).json({ error: 'Falta contenido.' });
+
+        // Resolver texto si es URL
+        let texto = input.trim();
+        if (texto.startsWith('http')) texto = await extraerTextoWeb(texto);
+
+        // Generar clase + pool de 15 preguntas (una sola llamada a IA)
+        const generated = await procesarConIAPool(texto);
+
+        const shortId = await shortIdUnico(Tarea);
+        const tarea = await Tarea.create({
+            shortId,
+            maestroId: req.maestro.id,
+            grupoId:   grupoId || null,
+            titulo:    generated.titulo,
+            abstract:  generated.abstract || '',
+            resumen:   generated.resumen,
+            flashcards: generated.flashcards || [],
+            poolPreguntas: generated.quiz || [],
+            contexto:  texto.substring(0, 10000)
+        });
+
+        res.json({ shortId: tarea.shortId, titulo: tarea.titulo, abstract: tarea.abstract });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Listar tareas del maestro (con conteo de sesiones por tarea)
+app.get('/api/maestro/tareas', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const tareas = await Tarea.find({ maestroId: req.maestro.id })
+            .select('shortId titulo abstract grupoId vistas creadoEn')
+            .sort({ creadoEn: -1 });
+
+        // Contar sesiones vinculadas a cada tarea
+        const counts = await Promise.all(
+            tareas.map(t => Sesion.countDocuments({ tareaId: t._id }))
+        );
+
+        const resultado = tareas.map((t, i) => ({
+            ...t.toObject(),
+            entregas: counts[i]
+        }));
+
+        res.json({ tareas: resultado });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar tarea del maestro
+app.delete('/api/maestro/tarea/:shortId', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const tarea = await Tarea.findOneAndDelete({ shortId: req.params.shortId, maestroId: req.maestro.id });
+        if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada.' });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Ruta pública — alumno carga la tarea (recibe 6 preguntas random del pool)
+app.get('/api/tarea/:shortId', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const tarea = await Tarea.findOneAndUpdate(
+            { shortId: req.params.shortId },
+            { $inc: { vistas: 1 } },
+            { new: true }
+        );
+        if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada.' });
+
+        // Seleccionar 6 preguntas aleatorias del pool
+        const pool = tarea.poolPreguntas || [];
+        const shuffled = [...pool].sort(() => Math.random() - 0.5);
+        const quiz6 = shuffled.slice(0, Math.min(6, shuffled.length));
+
+        res.json({
+            shortId:    tarea.shortId,
+            titulo:     tarea.titulo,
+            abstract:   tarea.abstract,
+            resumen:    tarea.resumen,
+            flashcards: tarea.flashcards,
+            quiz:       quiz6,
+            contexto:   tarea.contexto,
+            grupoId:    tarea.grupoId,
+            esTarea:    true   // flag para que el frontend sepa el origen
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
