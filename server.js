@@ -372,10 +372,143 @@ app.post('/api/chat', async (req, res) => {
     try {
         const { context, question } = req.body;
         const answer = await groqCall([
-            { role: 'system', content: 'Eres un tutor amable. Responde en español de forma concisa.' },
-            { role: 'user', content: `Contexto:\n${context}\n\nDuda: ${question}` }
+            { role: 'system', content: 'Eres un tutor amable de preparatoria. Responde en español de forma concisa y educativa. NUNCA generes contenido inapropiado, violento, sexual, político o que no sea estrictamente educativo. Si el alumno pregunta algo fuera del tema de estudio, redirigelo amablemente al tema.' },
+            { role: 'user', content: `Contexto del tema estudiado:\n${context}\n\nPregunta del alumno: ${question}` }
         ]);
         res.json({ answer });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ CHAT DEL MAESTRO — con contexto de datos del grupo ══
+app.post('/api/maestro/chat', verifyToken, async (req, res) => {
+    try {
+        const { grupoId, pregunta, historial } = req.body;
+        if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+
+        // Construir contexto del grupo si se proporciona
+        let contextoGrupo = '';
+        if (grupoId && mongoose.connection.readyState) {
+            const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id }).select('nombre semestre materia');
+            if (grupo) {
+                const sesiones = await Sesion.find({ grupoId })
+                    .sort({ creadoEn: -1 })
+                    .select('nombre pct correctas total creadoEn respuestasQuiz escuchoPodcast')
+                    .limit(200);
+
+                const hace7dias = new Date(Date.now() - 7*24*60*60*1000);
+                const alumnosMap = {};
+                [...sesiones].reverse().forEach(s => {
+                    if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = { nombre: s.nombre, sesiones:[], pctTotal:0 };
+                    alumnosMap[s.nombre].sesiones.push({ pct: s.pct, fecha: s.creadoEn });
+                    alumnosMap[s.nombre].pctTotal += (s.pct||0);
+                });
+                const alumnos = Object.values(alumnosMap).map(a => {
+                    const prom = Math.round(a.pctTotal / a.sesiones.length);
+                    const sems = a.sesiones.filter(s => new Date(s.fecha) >= hace7dias).length;
+                    const ult = a.sesiones[a.sesiones.length-1];
+                    const ant = a.sesiones[a.sesiones.length-2];
+                    const tend = ult && ant ? ult.pct - ant.pct : 0;
+                    const diasInact = ult ? Math.floor((Date.now()-new Date(ult.fecha))/86400000) : 999;
+                    return `- ${a.nombre}: promedio ${prom}%, ${a.sesiones.length} sesiones totales, ${sems} esta semana, tendencia ${tend>=0?'+':''}${tend}pts, última actividad hace ${diasInact} días`;
+                });
+
+                const fallosMap = {};
+                sesiones.forEach(s => (s.respuestasQuiz||[]).forEach(r => {
+                    if (!r.esCorrecta) fallosMap[r.pregunta] = (fallosMap[r.pregunta]||0)+1;
+                }));
+                const topFallos = Object.entries(fallosMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([p,v])=>`"${p}" (${v}x)`);
+
+                const promGrupo = sesiones.length ? Math.round(sesiones.reduce((a,s)=>a+(s.pct||0),0)/sesiones.length) : 0;
+                const semsTotal = sesiones.filter(s => new Date(s.creadoEn) >= hace7dias).length;
+
+                contextoGrupo = `
+GRUPO: ${grupo.nombre} | ${grupo.materia} | ${grupo.semestre}
+ESTADÍSTICAS DEL GRUPO:
+- Promedio general: ${promGrupo}%
+- Total de entregas: ${sesiones.length} (${semsTotal} esta semana)
+- Total alumnos únicos: ${alumnos.length}
+
+ALUMNOS (ordenados por promedio desc):
+${alumnos.sort((a,b) => {
+    const pa = parseInt(a.match(/promedio (\d+)/)?.[1]||0);
+    const pb = parseInt(b.match(/promedio (\d+)/)?.[1]||0);
+    return pb - pa;
+}).join('\n')}
+
+TEMAS MÁS FALLADOS: ${topFallos.join(' | ') || 'Sin datos suficientes'}`;
+            }
+        }
+
+        // Construir historial de mensajes para contexto multi-turno
+        const mensajesHistorial = (historial||[]).slice(-8).map(m => ({
+            role: m.role === 'maestro' ? 'user' : 'assistant',
+            content: m.texto
+        }));
+
+        const messages = [
+            { role: 'system', content: `Eres un asistente pedagógico experto para maestros de preparatoria. Tu rol es analizar datos de desempeño de alumnos y dar consejos ACCIONABLES, concretos y con nombres reales.
+
+REGLAS:
+- Respuestas máximo 3-4 párrafos cortos o listas breves
+- Siempre usa los nombres reales de los alumnos cuando los tienes
+- Da recomendaciones pedagógicas específicas (no genéricas)
+- Si te piden recursos, sugiere estrategias de búsqueda concretas
+- Habla directamente al maestro (tutéalo)
+- Si no tienes datos de un grupo, dilo y ofrece consejos generales
+${contextoGrupo ? `\nDATOS ACTUALES DEL GRUPO:\n${contextoGrupo}` : ''}` },
+            ...mensajesHistorial,
+            { role: 'user', content: pregunta }
+        ];
+
+        const answer = await groqCall(messages);
+        res.json({ answer });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ BÚSQUEDA DE RECURSOS EDUCATIVOS DE CALIDAD ══
+app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
+    try {
+        const { tema } = req.body;
+        if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
+
+        // Usar la IA para identificar los mejores recursos y URLs reales de fuentes institucionales
+        const prompt = `Eres un bibliotecario académico experto. El maestro necesita recursos educativos de ALTA CALIDAD en español (o inglés si no hay en español) sobre el tema: "${tema}".
+
+Busca y proporciona EXACTAMENTE 5 recursos reales de fuentes institucionales confiables. Prioriza:
+1. PDFs de universidades (.edu, .unam.mx, .ipn.mx, etc.)
+2. Khan Academy en español
+3. OpenStax (libros de texto abiertos)
+4. CONEVYT, SEP, o instituciones educativas mexicanas
+5. Enciclopedia Britannica, National Geographic Education
+6. Artículos de Wikipedia con fuentes verificables
+7. Coursera/edX materiales abiertos
+
+FORMATO JSON ESTRICTO (responde SOLO con este JSON):
+{
+  "recursos": [
+    {
+      "titulo": "Título real del recurso",
+      "fuente": "Nombre de la institución",
+      "tipo": "PDF" | "Artículo" | "Video" | "Libro" | "Curso",
+      "nivel": "Preparatoria" | "Universidad" | "General",
+      "descripcion": "1-2 oraciones de qué cubre este recurso",
+      "url": "URL real y verificable del recurso",
+      "idioma": "Español" | "Inglés"
+    }
+  ],
+  "consejo": "Una oración de consejo pedagógico sobre cómo usar estos recursos con el grupo."
+}
+
+Tema: ${tema}
+IMPORTANTE: Solo URLs reales que probablemente existan. Si no conoces la URL exacta de un recurso, usa la URL de la institución/sección donde se encontraría.`;
+
+        const text = await groqCall([
+            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido, sin texto extra.' },
+            { role: 'user', content: prompt }
+        ], true);
+
+        const data = JSON.parse(text);
+        res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
