@@ -490,68 +490,6 @@ app.get('/api/maestro/grupo/:grupoId', verifyToken, async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// ══ LEADERBOARD PÚBLICO (sin auth — el maestro comparte el link) ══
-app.get('/api/leaderboard/:grupoId', async (req, res) => {
-    try {
-        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const grupo = await Grupo.findById(req.params.grupoId).select('nombre semestre materia');
-        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
-
-        // Sesiones de los últimos 7 días para ranking semanal
-        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-        const sesiones = await Sesion.find({ grupoId: req.params.grupoId })
-            .sort({ creadoEn: -1 })
-            .select('nombre pct correctas total creadoEn escuchoPodcast');
-
-        const sesionsSemana = sesiones.filter(s => new Date(s.creadoEn) >= hace7dias);
-
-        // Calcular ranking por alumno
-        const alumnosMap = {};
-        sesiones.forEach(s => {
-            if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = {
-                nombre: s.nombre,
-                sesiones: 0, sesionsSemana: 0,
-                pctTotal: 0, pctSemana: 0,
-                perfectos: 0, perfectosSemana: 0,
-                ultimaSesion: null
-            };
-            const a = alumnosMap[s.nombre];
-            a.sesiones++;
-            a.pctTotal += (s.pct || 0);
-            if (s.pct === 100) a.perfectos++;
-            if (!a.ultimaSesion) a.ultimaSesion = s.creadoEn;
-        });
-        sesionsSemana.forEach(s => {
-            if (alumnosMap[s.nombre]) {
-                alumnosMap[s.nombre].sesionsSemana++;
-                alumnosMap[s.nombre].pctSemana += (s.pct || 0);
-                if (s.pct === 100) alumnosMap[s.nombre].perfectosSemana++;
-            }
-        });
-
-        // Aplicar fórmula de ranking
-        // scoreRanking = (0.35 * constancia) + (0.30 * promedio) + (0.20 * mejora) + (0.15 * perfectos)
-        const ranking = Object.values(alumnosMap).map(a => {
-            const promedio = a.sesiones > 0 ? Math.round(a.pctTotal / a.sesiones) : 0;
-            const constancia = Math.min(a.sesionsSemana / 7 * 100, 100); // max 100
-            const promedioSemana = a.sesionsSemana > 0 ? Math.round(a.pctSemana / a.sesionsSemana) : 0;
-            const perfectosPts = Math.min(a.perfectosSemana * 25, 100);
-            const score = Math.round(
-                (0.35 * constancia) +
-                (0.30 * promedioSemana) +
-                (0.20 * promedio) +
-                (0.15 * perfectosPts)
-            );
-            return { nombre: a.nombre, promedio, promedioSemana, sesiones: a.sesiones,
-                     sesionsSemana: a.sesionsSemana, perfectos: a.perfectos,
-                     perfectosSemana: a.perfectosSemana, score, ultimaSesion: a.ultimaSesion };
-        }).sort((a, b) => b.score - a.score);
-
-        res.json({ grupo, ranking, totalAlumnos: ranking.length, semana: hace7dias });
-    } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 // ══ PANEL ADMIN ══
 
 function verifyAdmin(req, res, next) {
