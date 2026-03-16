@@ -641,27 +641,165 @@ app.post('/api/maestro/agregar-grupo', verifyToken, async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Dashboard de un grupo — incluye sesiones para detalle por alumno
+// Dashboard de un grupo — Fase 2: datos enriquecidos
 app.get('/api/maestro/grupo/:grupoId', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const grupo = await Grupo.findOne({ _id: req.params.grupoId, maestroId: req.maestro.id });
         if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+
         const sesiones = await Sesion.find({ grupoId: req.params.grupoId })
             .sort({ creadoEn: -1 }).select('-__v -chatMensajes');
+
         const total = sesiones.length;
         const promedio = total ? Math.round(sesiones.reduce((a,s) => a+(s.pct||0), 0) / total) : 0;
-        const fallos = {};
-        sesiones.forEach(s => { (s.respuestasQuiz||[]).forEach(r => { if (!r.esCorrecta) fallos[r.pregunta] = (fallos[r.pregunta]||0) + 1; }); });
-        const preguntasMasFalladas = Object.entries(fallos).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([pregunta,veces])=>({pregunta,veces}));
-        const alumnosMap = {};
+
+        // ── Preguntas más falladas (solo las que fallan >50% del tiempo)
+        const fallosTotales = {};
+        const fallosConteo = {};
         sesiones.forEach(s => {
-            if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = { nombre: s.nombre, sesiones: 0, pctTotal: 0 };
-            alumnosMap[s.nombre].sesiones++;
-            alumnosMap[s.nombre].pctTotal += (s.pct||0);
+            (s.respuestasQuiz||[]).forEach(r => {
+                fallosConteo[r.pregunta] = (fallosConteo[r.pregunta]||0) + 1;
+                if (!r.esCorrecta) fallosTotales[r.pregunta] = (fallosTotales[r.pregunta]||0) + 1;
+            });
         });
-        const alumnos = Object.values(alumnosMap).map(a => ({ ...a, pctPromedio: Math.round(a.pctTotal / a.sesiones) }));
-        res.json({ grupo, total, promedio, preguntasMasFalladas, alumnos, sesiones });
+        const preguntasMasFalladas = Object.entries(fallosTotales)
+            .map(([pregunta, veces]) => ({
+                pregunta, veces,
+                total: fallosConteo[pregunta] || veces,
+                pctFallo: Math.round((veces / (fallosConteo[pregunta]||veces)) * 100)
+            }))
+            .filter(f => f.pctFallo >= 50)
+            .sort((a,b) => b.pctFallo - a.pctFallo)
+            .slice(0, 5);
+
+        // ── Por alumno: sesiones cronológicas para tendencia
+        const alumnosMap = {};
+        [...sesiones].reverse().forEach(s => {
+            if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = {
+                nombre: s.nombre,
+                sesiones: 0, pctTotal: 0,
+                historial: [],   // [{pct, fecha}] ordenado ASC
+                ultimaSesion: null
+            };
+            const a = alumnosMap[s.nombre];
+            a.sesiones++;
+            a.pctTotal += (s.pct||0);
+            a.historial.push({ pct: s.pct||0, fecha: s.creadoEn });
+            a.ultimaSesion = s.creadoEn; // último en DESC = más reciente
+        });
+        // Corregir ultimaSesion (viene reversed, tomamos el de sesiones DESC)
+        sesiones.forEach(s => {
+            if (alumnosMap[s.nombre] && !alumnosMap[s.nombre]._ultimaSet) {
+                alumnosMap[s.nombre].ultimaSesion = s.creadoEn;
+                alumnosMap[s.nombre]._ultimaSet = true;
+            }
+        });
+
+        const hace7dias = new Date(Date.now() - 7*24*60*60*1000);
+        const hace14dias = new Date(Date.now() - 14*24*60*60*1000);
+        const hoy = new Date();
+
+        const alumnos = Object.values(alumnosMap).map(a => {
+            const pctPromedio = Math.round(a.pctTotal / a.sesiones);
+            // Tendencia: diferencia entre última y penúltima sesión
+            const h = a.historial;
+            let tendencia = 0;
+            if (h.length >= 2) tendencia = h[h.length-1].pct - h[h.length-2].pct;
+            // Bajó más del 20% en las últimas 2 sesiones
+            const enRiesgo = h.length >= 2 && (h[h.length-1].pct - h[h.length-2].pct) <= -20;
+            // Sin actividad +7 días
+            const diasInactivo = a.ultimaSesion
+                ? Math.floor((hoy - new Date(a.ultimaSesion)) / 86400000) : 999;
+            const inactivo = diasInactivo >= 7;
+            // Sesiones esta semana vs semana anterior
+            const sesionesSemana = a.historial.filter(h => new Date(h.fecha) >= hace7dias).length;
+            const sesionesSemanaAnt = a.historial.filter(h => new Date(h.fecha) >= hace14dias && new Date(h.fecha) < hace7dias).length;
+            // Promedio semana actual
+            const pctsSemana = a.historial.filter(h => new Date(h.fecha) >= hace7dias).map(h => h.pct);
+            const promedioSemana = pctsSemana.length ? Math.round(pctsSemana.reduce((a,b)=>a+b,0)/pctsSemana.length) : null;
+            return {
+                nombre: a.nombre,
+                sesiones: a.sesiones,
+                pctPromedio,
+                promedioSemana,
+                tendencia,
+                enRiesgo,
+                inactivo,
+                diasInactivo,
+                sesionesSemana,
+                sesionesSemanaAnt,
+                ultimaSesion: a.ultimaSesion,
+                historial: h.slice(-6) // últimas 6 sesiones para mini sparkline
+            };
+        }).sort((a,b) => b.pctPromedio - a.pctPromedio);
+
+        // ── Top 3 semana (más sesiones + mejor promedio esta semana)
+        const top3Semana = [...alumnos]
+            .filter(a => a.sesionesSemana > 0)
+            .sort((a,b) => {
+                if (b.sesionesSemana !== a.sesionesSemana) return b.sesionesSemana - a.sesionesSemana;
+                return (b.promedioSemana||0) - (a.promedioSemana||0);
+            })
+            .slice(0,3)
+            .map((a,i) => ({ ...a, posicion: i+1 }));
+
+        // ── Alumnos en riesgo
+        const enRiesgo = alumnos.filter(a => a.enRiesgo || a.inactivo);
+
+        // ── Gráfica semanal: promedio del grupo por semana (últimas 8 semanas)
+        const graficaSemanal = [];
+        for (let i = 7; i >= 0; i--) {
+            const inicio = new Date(Date.now() - (i+1)*7*24*60*60*1000);
+            const fin    = new Date(Date.now() - i*7*24*60*60*1000);
+            const sesionesSem = sesiones.filter(s => new Date(s.creadoEn) >= inicio && new Date(s.creadoEn) < fin);
+            const prom = sesionesSem.length
+                ? Math.round(sesionesSem.reduce((a,s)=>a+(s.pct||0),0)/sesionesSem.length) : null;
+            const label = fin.toLocaleDateString('es-MX',{day:'numeric',month:'short'});
+            graficaSemanal.push({ label, promedio: prom, sesiones: sesionesSem.length });
+        }
+
+        // ── Heatmap por día de la semana
+        const diasNombre = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+        const heatmap = Array(7).fill(0);
+        sesiones.forEach(s => { heatmap[new Date(s.creadoEn).getDay()]++; });
+        const heatmapData = diasNombre.map((d,i) => ({ dia: d, sesiones: heatmap[i] }));
+
+        res.json({
+            grupo, total, promedio,
+            preguntasMasFalladas,
+            alumnos, sesiones,
+            top3Semana,
+            enRiesgo,
+            graficaSemanal,
+            heatmapData
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Comparativa entre todos los grupos del maestro
+app.get('/api/maestro/grupos/comparativa', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const grupos = await Grupo.find({ maestroId: req.maestro.id });
+        const hace7dias = new Date(Date.now() - 7*24*60*60*1000);
+
+        const comparativa = await Promise.all(grupos.map(async g => {
+            const sesiones = await Sesion.find({ grupoId: g._id })
+                .select('pct nombre creadoEn').sort({ creadoEn: -1 });
+            const total = sesiones.length;
+            const promedio = total ? Math.round(sesiones.reduce((a,s)=>a+(s.pct||0),0)/total) : 0;
+            const sesionesSemana = sesiones.filter(s => new Date(s.creadoEn) >= hace7dias).length;
+            const alumnos = new Set(sesiones.map(s=>s.nombre)).size;
+            const promedioSemana = (() => {
+                const ss = sesiones.filter(s => new Date(s.creadoEn) >= hace7dias);
+                return ss.length ? Math.round(ss.reduce((a,s)=>a+(s.pct||0),0)/ss.length) : null;
+            })();
+            return { grupoId: g._id, nombre: g.nombre, semestre: g.semestre, materia: g.materia,
+                     total, promedio, promedioSemana, sesionesSemana, alumnos };
+        }));
+
+        res.json({ comparativa });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
