@@ -58,6 +58,7 @@ const maestroSchema = new mongoose.Schema({
     nombre:      { type: String, required: true },
     email:       { type: String, required: true, unique: true, index: true },
     passwordHash:{ type: String, required: true },
+    escuelaId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
     creadoEn:    { type: Date, default: Date.now }
 });
 const Maestro = mongoose.models.Maestro || mongoose.model('Maestro', maestroSchema);
@@ -128,6 +129,35 @@ const Tarea = mongoose.models.Tarea || mongoose.model('Tarea', tareaSchema);
 
 const Invitacion = mongoose.models.Invitacion || mongoose.model('Invitacion', invitacionSchema);
 
+// Alumno
+const alumnoSchema = new mongoose.Schema({
+    nombre:       { type: String, required: true },
+    email:        { type: String, required: true, unique: true, index: true },
+    passwordHash: { type: String, required: true },
+    grupoId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    activo:       { type: Boolean, default: true },
+    creadoEn:     { type: Date, default: Date.now }
+});
+const Alumno = mongoose.models.Alumno || mongoose.model('Alumno', alumnoSchema);
+
+// Escuela
+const escuelaSchema = new mongoose.Schema({
+    nombre:   { type: String, required: true },
+    ciudad:   { type: String, default: 'Tijuana' },
+    creadoEn: { type: Date, default: Date.now }
+});
+const Escuela = mongoose.models.Escuela || mongoose.model('Escuela', escuelaSchema);
+
+// Director
+const directorSchema = new mongoose.Schema({
+    nombre:       { type: String, required: true },
+    email:        { type: String, required: true, unique: true, index: true },
+    passwordHash: { type: String, required: true },
+    escuelaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true },
+    creadoEn:     { type: Date, default: Date.now }
+});
+const Director = mongoose.models.Director || mongoose.model('Director', directorSchema);
+
 // ── Helpers
 function generarShortId() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -144,6 +174,328 @@ function verifyToken(req, res, next) {
     try { req.maestro = jwt.verify(token, JWT_SECRET); next(); }
     catch { res.status(401).json({ error: 'Token inválido.' }); }
 }
+
+// Verifica token de alumno (o maestro — los maestros pueden estudiar también)
+function verifyAlumnoOLibre(req, res, next) {
+    const token = req.headers.authorization?.replace('Bearer ','');
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            req.usuario = decoded;
+        } catch { /* token inválido — continuar sin usuario */ }
+    }
+    next();
+}
+
+// Verifica JWT del director
+function verifyDirector(req, res, next) {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No autorizado.' });
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.rol !== 'director') return res.status(403).json({ error: 'Acceso solo para directores.' });
+        req.director = decoded;
+        next();
+    } catch { res.status(401).json({ error: 'Token inválido.' }); }
+}
+
+// ══ ADMIN — ESCUELAS Y DIRECTORES ══
+
+app.post('/api/admin/escuela', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { nombre, ciudad } = req.body;
+        if (!nombre) return res.status(400).json({ error: 'Falta nombre de escuela.' });
+        const escuela = await Escuela.create({ nombre, ciudad: ciudad || 'Tijuana' });
+        res.json({ escuela });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/escuelas', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const escuelas = await Escuela.find().sort({ nombre: 1 }).lean();
+        const enriquecidas = await Promise.all(escuelas.map(async e => {
+            const totalMaestros = await Maestro.countDocuments({ escuelaId: e._id });
+            return { ...e, totalMaestros };
+        }));
+        res.json({ escuelas: enriquecidas });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/director', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { nombre, email, password, escuelaId } = req.body;
+        if (!nombre || !email || !password || !escuelaId) return res.status(400).json({ error: 'Faltan campos.' });
+        const existe = await Director.findOne({ email: email.toLowerCase() });
+        if (existe) return res.status(409).json({ error: 'Ya existe un director con ese email.' });
+        const passwordHash = await bcrypt.hash(password, 10);
+        const director = await Director.create({ nombre, email: email.toLowerCase(), passwordHash, escuelaId });
+        res.json({ director: { _id: director._id, nombre: director.nombre, email: director.email, escuelaId } });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/maestro/:maestroId/escuela', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { escuelaId } = req.body;
+        const maestro = await Maestro.findByIdAndUpdate(req.params.maestroId, { escuelaId: escuelaId || null }, { new: true }).select('-passwordHash');
+        if (!maestro) return res.status(404).json({ error: 'Maestro no encontrado.' });
+        res.json({ maestro });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ DIRECTOR — LOGIN Y PORTAL ══
+
+app.post('/api/director/login', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos.' });
+        const director = await Director.findOne({ email: email.toLowerCase() });
+        if (!director) return res.status(401).json({ error: 'Credenciales incorrectas.' });
+        const ok = await bcrypt.compare(password, director.passwordHash);
+        if (!ok) return res.status(401).json({ error: 'Credenciales incorrectas.' });
+        const escuela = await Escuela.findById(director.escuelaId).lean();
+        const token = jwt.sign(
+            { id: director._id, nombre: director.nombre, email: director.email, rol: 'director', escuelaId: director.escuelaId },
+            JWT_SECRET, { expiresIn: '30d' }
+        );
+        res.json({ token, director: { nombre: director.nombre, email: director.email, escuela } });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/director/resumen', verifyDirector, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { escuelaId } = req.director;
+        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+        const maestros   = await Maestro.find({ escuelaId }).select('-passwordHash').lean();
+        const maestroIds = maestros.map(m => m._id);
+        const grupos     = await Grupo.find({ maestroId: { $in: maestroIds } }).lean();
+        const grupoIds   = grupos.map(g => g._id);
+
+        const [totalSesiones, sesionesRecientes, sesionesHoy, totalAlumnos] = await Promise.all([
+            Sesion.countDocuments({ grupoId: { $in: grupoIds } }),
+            Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace7dias } }),
+            Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: new Date(new Date().setHours(0,0,0,0)) } }),
+            Alumno.countDocuments({ grupoId: { $in: grupoIds }, activo: true })
+        ]);
+
+        const todasSesiones = await Sesion.find({ grupoId: { $in: grupoIds } }).select('pct').lean();
+        const promedioGeneral = todasSesiones.length
+            ? Math.round(todasSesiones.reduce((a, s) => a + (s.pct || 0), 0) / todasSesiones.length) : null;
+
+        // Maestros activos en últimos 7 días
+        let maestrosActivos = 0;
+        for (const m of maestros) {
+            const mGrupoIds = grupos.filter(g => g.maestroId.toString() === m._id.toString()).map(g => g._id);
+            const reciente = await Sesion.findOne({ grupoId: { $in: mGrupoIds }, creadoEn: { $gte: hace7dias } }).lean();
+            if (reciente) maestrosActivos++;
+        }
+
+        const escuela = await Escuela.findById(escuelaId).lean();
+        res.json({
+            escuela, totalMaestros: maestros.length, maestrosActivos,
+            totalGrupos: grupos.length, totalAlumnos, totalSesiones,
+            sesionesRecientes, sesionesHoy, promedioGeneral
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/director/maestros', verifyDirector, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { escuelaId } = req.director;
+        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const maestros  = await Maestro.find({ escuelaId }).select('-passwordHash').lean();
+
+        const detalle = await Promise.all(maestros.map(async m => {
+            const grupos   = await Grupo.find({ maestroId: m._id }).lean();
+            const grupoIds = grupos.map(g => g._id);
+            const [totalTareas, totalSesiones, sesionesRecientes, totalAlumnos] = await Promise.all([
+                Tarea.countDocuments({ maestroId: m._id }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds } }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace7dias } }),
+                Alumno.countDocuments({ grupoId: { $in: grupoIds }, activo: true })
+            ]);
+            const sesionesPct = await Sesion.find({ grupoId: { $in: grupoIds } }).select('pct').lean();
+            const promedio = sesionesPct.length
+                ? Math.round(sesionesPct.reduce((a, s) => a + (s.pct || 0), 0) / sesionesPct.length) : null;
+            const [ultSesion, ultTarea] = await Promise.all([
+                Sesion.findOne({ grupoId: { $in: grupoIds } }).sort({ creadoEn: -1 }).select('creadoEn').lean(),
+                Tarea.findOne({ maestroId: m._id }).sort({ creadoEn: -1 }).select('creadoEn').lean()
+            ]);
+            const ultimaActividad = [ultSesion?.creadoEn, ultTarea?.creadoEn]
+                .filter(Boolean).sort((a, b) => b - a)[0] || null;
+            return { ...m, grupos, totalTareas, totalSesiones, sesionesRecientes, totalAlumnos, promedio, ultimaActividad };
+        }));
+
+        res.json({ maestros: detalle });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/director/grupo/:grupoId', verifyDirector, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { escuelaId } = req.director;
+        const grupo = await Grupo.findById(req.params.grupoId).lean();
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+        const maestro = await Maestro.findOne({ _id: grupo.maestroId, escuelaId }).lean();
+        if (!maestro) return res.status(403).json({ error: 'Sin acceso a este grupo.' });
+
+        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const sesiones  = await Sesion.find({ grupoId: grupo._id })
+            .sort({ creadoEn: -1 })
+            .select('-chatMensajes -respuestasQuiz -tarjetasAbiertas').lean();
+        const alumnos = await Alumno.find({ grupoId: grupo._id, activo: true }).select('-passwordHash').lean();
+
+        // Agrupar sesiones por alumno
+        const porAlumno = {};
+        sesiones.forEach(s => {
+            if (!porAlumno[s.nombre]) porAlumno[s.nombre] = [];
+            porAlumno[s.nombre].push(s);
+        });
+        const resumenAlumnos = Object.entries(porAlumno).map(([nombre, ss]) => ({
+            nombre,
+            totalSesiones: ss.length,
+            promedio: Math.round(ss.reduce((a, s) => a + (s.pct || 0), 0) / ss.length),
+            recientes: ss.filter(s => new Date(s.creadoEn) >= hace7dias).length,
+            ultimaActividad: ss[0]?.creadoEn
+        })).sort((a, b) => b.promedio - a.promedio);
+
+        const promedioGrupo = sesiones.length
+            ? Math.round(sesiones.reduce((a, s) => a + (s.pct || 0), 0) / sesiones.length) : null;
+
+        res.json({
+            grupo, maestro, alumnos, resumenAlumnos, promedioGrupo,
+            totalSesiones: sesiones.length,
+            sesionesRecientes: sesiones.filter(s => new Date(s.creadoEn) >= hace7dias).length
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/director/alumno/:grupoId/:nombre', verifyDirector, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { escuelaId } = req.director;
+        const grupo = await Grupo.findById(req.params.grupoId).lean();
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+        const maestro = await Maestro.findOne({ _id: grupo.maestroId, escuelaId }).lean();
+        if (!maestro) return res.status(403).json({ error: 'Sin acceso.' });
+        const nombre = decodeURIComponent(req.params.nombre);
+        const sesiones = await Sesion.find({ grupoId: grupo._id, nombre: { $regex: new RegExp(nombre, 'i') } })
+            .sort({ creadoEn: -1 }).select('-chatMensajes -respuestasQuiz -tarjetasAbiertas').lean();
+        const promedio = sesiones.length
+            ? Math.round(sesiones.reduce((a, s) => a + (s.pct || 0), 0) / sesiones.length) : null;
+        res.json({ nombre, grupo, sesiones, promedio, totalSesiones: sesiones.length });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── RUTAS ALUMNO ──────────────────────────────────────────
+
+// Registro de alumno (solo admin puede crear alumnos)
+app.post('/api/admin/alumno', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { nombre, email, password, grupoId } = req.body;
+        if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan nombre, email o contraseña.' });
+        const existe = await Alumno.findOne({ email: email.toLowerCase() });
+        if (existe) return res.status(409).json({ error: 'Ya existe un alumno con ese email.' });
+        const passwordHash = await bcrypt.hash(password, 10);
+        const alumno = await Alumno.create({
+            nombre, email: email.toLowerCase(), passwordHash,
+            grupoId: grupoId || null, activo: true
+        });
+        res.json({ alumno: { _id: alumno._id, nombre: alumno.nombre, email: alumno.email, grupoId: alumno.grupoId } });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Bulk: crear varios alumnos a la vez
+app.post('/api/admin/alumnos/bulk', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { alumnos, grupoId } = req.body; // alumnos: [{nombre, email, password}]
+        if (!alumnos?.length) return res.status(400).json({ error: 'Sin alumnos en la lista.' });
+        const resultados = { creados: 0, errores: [] };
+        for (const a of alumnos) {
+            try {
+                const existe = await Alumno.findOne({ email: a.email.toLowerCase() });
+                if (existe) { resultados.errores.push(`${a.email}: ya existe`); continue; }
+                const passwordHash = await bcrypt.hash(a.password || 'Tutor2025!', 10);
+                await Alumno.create({ nombre: a.nombre, email: a.email.toLowerCase(), passwordHash, grupoId: grupoId || null, activo: true });
+                resultados.creados++;
+            } catch(e) { resultados.errores.push(`${a.email}: ${e.message}`); }
+        }
+        res.json(resultados);
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Listar alumnos (con filtro por grupo)
+app.get('/api/admin/alumnos', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { grupoId } = req.query;
+        const filtro = grupoId ? { grupoId } : {};
+        const alumnos = await Alumno.find(filtro).select('-passwordHash').sort({ nombre: 1 });
+
+        // Enriquecer con stats de sesiones
+        const enriquecidos = await Promise.all(alumnos.map(async a => {
+            const grupo = a.grupoId ? await Grupo.findById(a.grupoId).select('nombre semestre materia').lean() : null;
+            const sesiones = await Sesion.find({ nombre: { $regex: new RegExp(a.nombre, 'i') } })
+                .select('pct creadoEn').sort({ creadoEn: -1 }).limit(50).lean();
+            const promedio = sesiones.length
+                ? Math.round(sesiones.reduce((s, x) => s + (x.pct || 0), 0) / sesiones.length) : null;
+            const ultimaActividad = sesiones[0]?.creadoEn || null;
+            return { ...a.toObject(), grupo, totalSesiones: sesiones.length, promedio, ultimaActividad };
+        }));
+
+        const grupos = await Grupo.find().select('_id nombre semestre materia').lean();
+        res.json({ alumnos: enriquecidos, grupos });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Activar/desactivar o cambiar grupo de alumno
+app.patch('/api/admin/alumno/:alumnoId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { activo, grupoId } = req.body;
+        const update = {};
+        if (activo !== undefined) update.activo = activo;
+        if (grupoId !== undefined) update.grupoId = grupoId || null;
+        const alumno = await Alumno.findByIdAndUpdate(req.params.alumnoId, update, { new: true }).select('-passwordHash');
+        if (!alumno) return res.status(404).json({ error: 'Alumno no encontrado.' });
+        res.json({ alumno });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar alumno
+app.delete('/api/admin/alumno/:alumnoId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        await Alumno.findByIdAndDelete(req.params.alumnoId);
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Login de alumno
+app.post('/api/alumno/login', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos.' });
+        const alumno = await Alumno.findOne({ email: email.toLowerCase() });
+        if (!alumno) return res.status(401).json({ error: 'Credenciales incorrectas.' });
+        if (!alumno.activo) return res.status(403).json({ error: 'Cuenta desactivada. Contacta a tu maestro.' });
+        const ok = await bcrypt.compare(password, alumno.passwordHash);
+        if (!ok) return res.status(401).json({ error: 'Credenciales incorrectas.' });
+        const grupo = alumno.grupoId ? await Grupo.findById(alumno.grupoId).select('nombre semestre materia shortId').lean() : null;
+        const token = jwt.sign({ id: alumno._id, nombre: alumno.nombre, email: alumno.email, rol: 'alumno', grupoId: alumno.grupoId }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ token, alumno: { nombre: alumno.nombre, email: alumno.email, grupoId: alumno.grupoId, grupo } });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Groq
 async function groqCall(messages, jsonMode = false) {
@@ -471,54 +823,109 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         const { tema } = req.body;
         if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
 
-        const prompt = `Eres un experto en recursos educativos digitales. Un maestro de preparatoria necesita materiales de ALTA CALIDAD sobre: "${tema}".
+        // ── Paso 1: IA genera sugerencias con URLs candidatas
+        const promptSugerencias = `Eres un experto en recursos educativos digitales para preparatoria en México.
+Un maestro necesita materiales de ALTA CALIDAD sobre: "${tema}".
 
-INSTRUCCIONES CLAVE:
+REGLAS CRÍTICAS PARA URLS:
+- Solo fuentes que existen con certeza absoluta
+- Wikipedia en español: SIEMPRE usa el formato https://es.wikipedia.org/wiki/TITULO_CON_GUIONES_BAJOS
+- Khan Academy: https://es.khanacademy.org/SECCION/TEMA (solo si sabes la URL exacta)
+- YouTube: https://www.youtube.com/results?search_query=TEMA+educativo (búsqueda, no video específico)
+- Para cualquier otro sitio: SOLO la homepage si no conoces el artículo exacto
+- NUNCA inventes rutas de artículos — es mejor la homepage que una URL falsa
+- PDFs universitarios: solo si conoces la URL exacta del PDF
 
-1. CALIDAD SOBRE RESTRICCIÓN: El internet es vasto. Busca los mejores recursos disponibles — pueden ser .com, .org, .edu, .net, o cualquier dominio. Lo que importa es que sean contenido serio y confiable, no el dominio.
+FUENTES CONFIABLES POR TIPO:
+- Artículos procesables: Wikipedia ES, Khan Academy ES, SEP (gob.mx), UNAM, enciclopedia.mx
+- Videos de apoyo: YouTube (búsqueda general), Canal Once, UNAM en línea
+- PDFs: repositorios .unam.mx, .ipn.mx, .sep.gob.mx
 
-2. EVALUACIÓN DE ACCESIBILIDAD — Para cada recurso pregúntate: "¿Puede un alumno abrir este link y leer/ver el contenido completo SIN registrarse ni pagar?" 
-   - Si sí → procesable: true
-   - Si no (paywall, login requerido, suscripción) → procesable: false
-   - Videos de YouTube, Vimeo, etc. → procesable: false (son material de apoyo visual)
+Genera exactamente 4 recursos procesables y 3 videos de apoyo.
 
-3. URLS ESPECÍFICAS — NUNCA pongas la homepage de un sitio (ej: britannica.com). Siempre el artículo específico del tema (ej: britannica.com/event/French-Revolution). Si no conoces la URL exacta del artículo, construye una URL probable basada en cómo ese sitio organiza su contenido.
-
-4. PAYWALL CONOCIDOS — Estos SIEMPRE son procesable: false: Coursera, Udemy, edX (cursos de pago), NYT, WSJ, The Economist, Nature (artículos cerrados), CNN, BBC (algunos), Medium (artículos de pago).
-
-5. BALANCE — Busca 4-5 recursos procesables (texto/PDF) y 2-3 videos de apoyo.
-
-FORMATO JSON (responde SOLO con este JSON válido):
+FORMATO JSON ESTRICTO:
 {
   "recursos": [
     {
-      "titulo": "Título descriptivo y específico del recurso",
-      "fuente": "Nombre del sitio o institución",
-      "tipo": "Artículo" | "PDF" | "Libro" | "Video" | "Infografía",
+      "titulo": "Título descriptivo del recurso",
+      "fuente": "Nombre del sitio",
+      "tipo": "Artículo" | "PDF" | "Video",
       "nivel": "Preparatoria" | "Universidad" | "General",
-      "descripcion": "2 oraciones: qué cubre exactamente y por qué es útil para este tema",
-      "url": "https://url-especifica-del-articulo-no-homepage.com/tema-especifico",
+      "descripcion": "Qué cubre y por qué es útil en 1-2 oraciones",
+      "url": "https://url-real-y-verificable.com/ruta",
       "idioma": "Español" | "Inglés",
-      "procesable": true,
-      "razon_acceso": "Libre acceso sin registro" | "Paywall/Login requerido" | "Video (solo referencia)"
+      "procesable": true | false,
+      "esVideo": false | true
     }
   ],
-  "consejo": "Consejo pedagógico de 1-2 oraciones sobre cómo usar estos recursos con el grupo."
-}
-
-Tema a buscar: "${tema}"`;
+  "consejo": "Consejo pedagógico breve sobre cómo usar estos recursos."
+}`;
 
         const text = await groqCall([
-            { role: 'system', content: 'Eres un experto en recursos educativos digitales. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
-            { role: 'user', content: prompt }
+            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
+            { role: 'user', content: promptSugerencias }
         ], true);
 
         const data = JSON.parse(text);
-
-        // Separar en procesables y material extra
         const recursos = data.recursos || [];
-        data.paraTarea   = recursos.filter(r => r.procesable === true && r.tipo !== 'Video');
-        data.materialExtra = recursos.filter(r => r.procesable === false || r.tipo === 'Video');
+
+        // ── Paso 2: Verificar URLs reales (HEAD request con timeout corto)
+        async function verificarURL(url) {
+            try {
+                const ctrl = new AbortController();
+                const timeout = setTimeout(() => ctrl.abort(), 5000);
+                const response = await axios.head(url, {
+                    signal: ctrl.signal,
+                    timeout: 5000,
+                    maxRedirects: 3,
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; educational-bot/1.0)' },
+                    validateStatus: s => s < 500 // 200-499 = URL existe
+                });
+                clearTimeout(timeout);
+                return response.status < 400; // 200-399 = accesible
+            } catch {
+                return false;
+            }
+        }
+
+        // Verificar en paralelo con límite de concurrencia
+        const verificados = await Promise.all(
+            recursos.map(async r => {
+                const activa = await verificarURL(r.url);
+                return { ...r, urlActiva: activa };
+            })
+        );
+
+        // ── Paso 3: Para URLs caídas de Wikipedia, construir URL alternativa conocida
+        const conFallback = verificados.map(r => {
+            if (!r.urlActiva) {
+                // Si era Wikipedia, construir URL de búsqueda como fallback
+                if (r.url.includes('wikipedia.org')) {
+                    const busqueda = encodeURIComponent(tema);
+                    r.url = `https://es.wikipedia.org/w/index.php?search=${busqueda}`;
+                    r.urlActiva = true;
+                    r.esFallback = true;
+                } else if (r.esVideo || r.tipo === 'Video') {
+                    // Videos sin URL válida → búsqueda en YouTube
+                    const busqueda = encodeURIComponent(`${tema} explicación educativa`);
+                    r.url = `https://www.youtube.com/results?search_query=${busqueda}`;
+                    r.urlActiva = true;
+                    r.esFallback = true;
+                } else {
+                    // Otros recursos con URL caída → búsqueda en Google académico
+                    const busqueda = encodeURIComponent(`${tema} sitio:edu OR sitio:gob.mx`);
+                    r.url = `https://www.google.com/search?q=${busqueda}`;
+                    r.urlActiva = true;
+                    r.esFallback = true;
+                }
+            }
+            return r;
+        });
+
+        // Separar en secciones
+        data.paraTarea     = conFallback.filter(r => r.procesable && !r.esVideo && r.tipo !== 'Video');
+        data.materialExtra = conFallback.filter(r => !r.procesable || r.esVideo || r.tipo === 'Video');
+        data.recursos      = conFallback;
 
         res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1111,17 +1518,88 @@ function generarCodigoInvitacion(nombre) {
     return `INV-${iniciales}-${rand}`;
 }
 
-// Listar todos los maestros
+// Listar todos los maestros con grupos y actividad
 app.get('/api/admin/maestros', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const maestros = await Maestro.find().select('-passwordHash').sort({ creadoEn: -1 });
         const invitaciones = await Invitacion.find({ usada: false });
-        res.json({ maestros, invitaciones });
+
+        // Enriquecer cada maestro con sus grupos y stats
+        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const maestrosEnriquecidos = await Promise.all(maestros.map(async m => {
+            const grupos = await Grupo.find({ maestroId: m._id }).select('_id shortId nombre semestre materia').lean();
+            const grupoIds = grupos.map(g => g._id);
+
+            const [totalTareas, totalSesiones, sesionesRecientes] = await Promise.all([
+                Tarea.countDocuments({ maestroId: m._id }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds } }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace7dias } })
+            ]);
+
+            // Promedio del maestro
+            const sesionesConPct = await Sesion.find({ grupoId: { $in: grupoIds } }).select('pct').lean();
+            const promedio = sesionesConPct.length
+                ? Math.round(sesionesConPct.reduce((a, s) => a + (s.pct || 0), 0) / sesionesConPct.length)
+                : null;
+
+            // Última actividad
+            const ultimaSesion = await Sesion.findOne({ grupoId: { $in: grupoIds } })
+                .sort({ creadoEn: -1 }).select('creadoEn').lean();
+            const ultimaTarea = await Tarea.findOne({ maestroId: m._id })
+                .sort({ creadoEn: -1 }).select('creadoEn').lean();
+            const ultimaActividad = [ultimaSesion?.creadoEn, ultimaTarea?.creadoEn]
+                .filter(Boolean).sort((a, b) => b - a)[0] || null;
+
+            return {
+                _id: m._id, nombre: m.nombre, email: m.email, creadoEn: m.creadoEn,
+                grupos, totalTareas, totalSesiones, sesionesRecientes,
+                promedio, ultimaActividad
+            };
+        }));
+
+        res.json({ maestros: maestrosEnriquecidos, invitaciones });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Crear invitación para un maestro (genera código + crea grupos automáticamente al usarse)
+// Agregar grupo a un maestro existente
+app.post('/api/admin/maestro/:maestroId/grupo', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { maestroId } = req.params;
+        const { semestre, materia } = req.body;
+        if (!semestre || !materia) return res.status(400).json({ error: 'Faltan semestre y materia.' });
+        const maestro = await Maestro.findById(maestroId);
+        if (!maestro) return res.status(404).json({ error: 'Maestro no encontrado.' });
+        // Verificar que no tenga ya ese grupo
+        const existe = await Grupo.findOne({ maestroId, semestre, materia });
+        if (existe) return res.status(400).json({ error: 'El maestro ya tiene ese grupo.' });
+        const shortId = await shortIdUnico(Grupo);
+        const grupo = await Grupo.create({
+            shortId, nombre: `${materia} — ${semestre}`,
+            semestre, materia, maestroId
+        });
+        res.json({ grupo });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Quitar grupo de un maestro
+app.delete('/api/admin/maestro/:maestroId/grupo/:grupoId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { maestroId, grupoId } = req.params;
+        const grupo = await Grupo.findOne({ _id: grupoId, maestroId });
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado para este maestro.' });
+        // Borrar el grupo y sus tareas (sesiones se conservan por historial)
+        await Promise.all([
+            Grupo.deleteOne({ _id: grupoId }),
+            Tarea.deleteMany({ grupoId })
+        ]);
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/invitacion', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
