@@ -356,6 +356,142 @@ app.post('/api/director/login', async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══ DASHBOARD DIRECTOR — datos completos en una sola llamada ══
+app.get('/api/director/dashboard', verifyDirector, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const escuelaId = req.director.escuelaId;
+
+        const hace30 = new Date(Date.now()-30*24*60*60*1000);
+        const hace7  = new Date(Date.now()-7*24*60*60*1000);
+        const hace1  = new Date(Date.now()-24*60*60*1000);
+        const hoy    = new Date(new Date().setHours(0,0,0,0));
+
+        // Maestros y grupos de esta institución
+        const maestros   = await Maestro.find({ escuelaId }).select('-passwordHash').lean();
+        const maestroIds = maestros.map(m => m._id);
+        const grupos     = await Grupo.find({ maestroId: { $in: maestroIds } }).lean();
+        const grupoIds   = grupos.map(g => g._id);
+        const alumnos    = await Alumno.find({ grupoId: { $in: grupoIds }, activo: true }).select('nombre email grupoId logros creadoEn limiteDiario').lean();
+        const tareas     = await Tarea.find({ maestroId: { $in: maestroIds } }).select('titulo maestroId grupoId creadoEn').lean();
+
+        // Sesiones de toda la institución
+        const sesiones30 = await Sesion.find({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace30 } })
+            .sort({ creadoEn: -1 }).select('nombre pct correctas total titulo fecha hora creadoEn grupoId escuchoPodcast').lean();
+
+        const [sesToday, ses7d] = [
+            sesiones30.filter(s => new Date(s.creadoEn) >= hoy).length,
+            sesiones30.filter(s => new Date(s.creadoEn) >= hace7).length
+        ];
+
+        const promInst = sesiones30.length ? Math.round(sesiones30.reduce((a,s)=>a+(s.pct||0),0)/sesiones30.length) : null;
+
+        // ── MÉTRICAS POR MAESTRO ──
+        const metricasMaestros = await Promise.all(maestros.map(async m => {
+            const mGrupos  = grupos.filter(g => String(g.maestroId) === String(m._id));
+            const mGrupoIds = mGrupos.map(g => g._id);
+            const mSes     = sesiones30.filter(s => mGrupoIds.some(id => String(id) === String(s.grupoId)));
+            const mAlumnos = alumnos.filter(a => mGrupoIds.some(id => String(id) === String(a.grupoId)));
+            const mTareas  = tareas.filter(t => String(t.maestroId) === String(m._id));
+            const mSesToday = mSes.filter(s => new Date(s.creadoEn) >= hoy).length;
+            const mSes7d    = mSes.filter(s => new Date(s.creadoEn) >= hace7).length;
+            const mProm     = mSes.length ? Math.round(mSes.reduce((a,s)=>a+(s.pct||0),0)/mSes.length) : null;
+            const ultimaAct = mSes[0]?.creadoEn || null;
+            const diasInact = ultimaAct ? Math.floor((Date.now()-new Date(ultimaAct))/86400000) : 999;
+            return {
+                _id: m._id, nombre: m.nombre, email: m.email,
+                totalGrupos: mGrupos.length, totalAlumnos: mAlumnos.length,
+                totalTareas: mTareas.length, totalSesiones30: mSes.length,
+                sesionesHoy: mSesToday, sesiones7d: mSes7d,
+                promedio: mProm, diasInactividad: diasInact,
+                ultimaActividad: ultimaAct,
+                grupos: mGrupos.map(g=>({ _id: g._id, nombre: g.nombre, materia: g.materia, semestre: g.semestre }))
+            };
+        }));
+
+        // Ordenar: destacados (más activos) y en alerta (más inactivos)
+        const maestrosDestacados = [...metricasMaestros].sort((a,b) => b.sesiones7d - a.sesiones7d).slice(0,3);
+        const maestrosAlerta     = metricasMaestros.filter(m => m.diasInactividad >= 7).sort((a,b) => b.diasInactividad - a.diasInactividad);
+
+        // ── MÉTRICAS POR ALUMNO ──
+        const alumnosMap = {};
+        sesiones30.forEach(s => {
+            if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = { pcts: [], sesiones: [] };
+            alumnosMap[s.nombre].pcts.push(s.pct||0);
+            alumnosMap[s.nombre].sesiones.push(s);
+        });
+        const alumnosDetalle = alumnos.map(a => {
+            const data = alumnosMap[a.nombre] || { pcts: [], sesiones: [] };
+            const prom = data.pcts.length ? Math.round(data.pcts.reduce((x,y)=>x+y,0)/data.pcts.length) : null;
+            const ultimas3 = data.pcts.slice(0,3);
+            const prom3    = ultimas3.length ? Math.round(ultimas3.reduce((x,y)=>x+y,0)/ultimas3.length) : null;
+            const ult      = data.sesiones[0];
+            const diasInact = ult ? Math.floor((Date.now()-new Date(ult.creadoEn))/86400000) : 999;
+            const grupo    = grupos.find(g => String(g._id) === String(a.grupoId));
+            return {
+                _id: a._id, nombre: a.nombre,
+                grupo: grupo ? { nombre: grupo.nombre, materia: grupo.materia } : null,
+                promedio: prom, promedio3: prom3,
+                totalSesiones: data.pcts.length,
+                diasInactividad: diasInact,
+                logros: (a.logros||[]).length,
+                enRiesgo: prom3 !== null && prom3 < 60
+            };
+        });
+
+        const alumnosRiesgo     = alumnosDetalle.filter(a => a.enRiesgo).sort((a,b)=>a.promedio3-b.promedio3);
+        const alumnosDestacados = alumnosDetalle.filter(a => a.promedio !== null).sort((a,b)=>b.promedio-a.promedio).slice(0,5);
+
+        // ── ACTIVIDAD RECIENTE (últimas 24h) ──
+        const actividadReciente = sesiones30.filter(s => new Date(s.creadoEn) >= hace1).slice(0,20).map(s => {
+            const grupo = grupos.find(g => String(g._id) === String(s.grupoId));
+            const maestro = grupo ? maestros.find(m => String(m._id) === String(grupo.maestroId)) : null;
+            return { nombre: s.nombre, titulo: s.titulo, pct: s.pct, hora: s.hora, fecha: s.fecha,
+                     grupo: grupo?.nombre, maestro: maestro?.nombre };
+        });
+
+        // ── TOP TEMAS ──
+        const temasMap = {};
+        sesiones30.forEach(s => { temasMap[s.titulo] = (temasMap[s.titulo]||0)+1; });
+        const topTemas = Object.entries(temasMap).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([tema,cnt])=>({ tema, sesiones: cnt }));
+
+        // ── SESIONES POR DÍA (14 días) ──
+        const diasMap = {};
+        sesiones30.forEach(s => {
+            const d = new Date(s.creadoEn).toISOString().split('T')[0];
+            diasMap[d] = (diasMap[d]||0)+1;
+        });
+        const sesionesPorDia = [];
+        for (let i=13; i>=0; i--) {
+            const d = new Date(Date.now()-i*86400000).toISOString().split('T')[0];
+            sesionesPorDia.push({ fecha: d, count: diasMap[d]||0 });
+        }
+
+        // ── TASA DE COMPLETACIÓN POR TAREA ──
+        const tareasConTasa = await Promise.all(tareas.slice(0,10).map(async t => {
+            const grupoAlumnos = alumnos.filter(a => String(a.grupoId) === String(t.grupoId)).length;
+            const completaron  = await Sesion.countDocuments({ tareaId: t._id });
+            return { titulo: t.titulo, alumnos: grupoAlumnos, completaron, tasa: grupoAlumnos ? Math.round((completaron/grupoAlumnos)*100) : 0 };
+        }));
+
+        const escuela = await Escuela.findById(escuelaId).lean();
+
+        res.json({
+            escuela,
+            kpis: {
+                totalMaestros: maestros.length, totalGrupos: grupos.length,
+                totalAlumnos: alumnos.length, totalTareas: tareas.length,
+                sesionesHoy: sesToday, sesiones7d: ses7d, sesiones30d: sesiones30.length,
+                promedioInstitucional: promInst, alumnosEnRiesgo: alumnosRiesgo.length,
+                maestrosActivos7d: metricasMaestros.filter(m=>m.sesiones7d>0).length
+            },
+            maestrosDestacados, maestrosAlerta, maestrosTodos: metricasMaestros,
+            alumnosRiesgo: alumnosRiesgo.slice(0,10), alumnosDestacados,
+            actividadReciente, topTemas, sesionesPorDia, tareasConTasa
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/director/resumen', verifyDirector, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
@@ -589,8 +725,17 @@ app.post('/api/alumno/login', async (req, res) => {
 
 // ── Groq
 // ══ LLAMADA IA UNIVERSAL — Gemini 2.5 Flash (primero) + GROQ fallback ══
+// Límites de tokens por tipo de llamada
+const TOKEN_LIMITS = {
+    estudiar: 8192,  // clase completa
+    tarea:    8192,  // pool de 15 preguntas
+    chat:     2048,  // respuestas de chat
+    recursos: 1024,  // búsqueda de recursos
+    examen:   4096,  // generación de examen
+    vision:   4096,  // extracción de imagen
+};
+
 async function iaCall(messages, jsonMode = false, meta = {}) {
-    // Intentar Gemini 2.5 Flash primero
     if (GEMINI_KEY) {
         try {
             return await geminiCall(messages, jsonMode, meta);
@@ -598,55 +743,61 @@ async function iaCall(messages, jsonMode = false, meta = {}) {
             console.warn('Gemini falló, usando GROQ fallback:', e.message);
         }
     }
-    // Fallback GROQ
-    return await iaCall(messages, jsonMode, meta);
+    if (!GROQ_KEY) throw new Error('No hay motor de IA configurado. Agrega GEMINI_API_KEY o GROQ_API_KEY en Render.');
+    return await groqCall(messages, jsonMode, meta);
 }
 
 async function geminiCall(messages, jsonMode = false, meta = {}) {
-    // Convertir formato OpenAI → Gemini
     const systemMsg = messages.find(m => m.role === 'system');
     const userMsgs  = messages.filter(m => m.role !== 'system');
+    const maxOut    = TOKEN_LIMITS[meta.tipo] || 4096;
 
+    // Convertir formato OpenAI → Gemini
     const contents = userMsgs.map(m => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: Array.isArray(m.content)
             ? m.content.map(c => c.type === 'image_url'
                 ? { inlineData: { mimeType: c.image_url.url.split(';')[0].split(':')[1], data: c.image_url.url.split(',')[1] } }
                 : { text: c.text || '' })
-            : [{ text: m.content }]
-    }));
+            : [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }]
+    })).filter(m => m.parts.some(p => (p.text || p.inlineData)));
 
     const body = {
         contents,
         systemInstruction: systemMsg ? { parts: [{ text: systemMsg.content }] } : undefined,
         generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 8192,
+            temperature: meta.tipo === 'chat' ? 0.8 : 0.7,
+            maxOutputTokens: maxOut,
             ...(jsonMode ? { responseMimeType: 'application/json' } : {})
-        }
+        },
+        safetySettings: [
+            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' },
+            { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' }
+        ]
     };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
     const response = await axios.post(url, body, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 60000
+        timeout: 90000
     });
 
     const candidate = response.data.candidates?.[0];
-    const text = candidate?.content?.parts?.map(p => p.text).join('') || '';
-    if (!text) throw new Error('Gemini retornó respuesta vacía');
+    if (!candidate) throw new Error('Gemini no retornó candidatos');
+    if (candidate.finishReason === 'SAFETY') throw new Error('Contenido bloqueado por seguridad');
 
-    // Registrar uso
+    const text = candidate.content?.parts?.map(p => p.text || '').join('') || '';
+    if (!text.trim()) throw new Error('Gemini retornó respuesta vacía');
+
+    // Registrar uso de tokens
     const usage = response.data.usageMetadata || {};
     const tokensInput  = usage.promptTokenCount     || 0;
     const tokensOutput = usage.candidatesTokenCount || 0;
-    const costoUSD = (tokensInput * 0.000000075) + (tokensOutput * 0.0000003); // Gemini 2.5 Flash
-    if (mongoose.connection.readyState) {
+    const costoUSD = (tokensInput * 0.000000075) + (tokensOutput * 0.0000003);
+    if (mongoose.connection.readyState && (tokensInput + tokensOutput) > 0) {
         UsageLog.create({
-            escuelaId: meta.escuelaId || null,
-            maestroId: meta.maestroId || null,
-            tipo: meta.tipo || 'estudiar',
-            modelo: GEMINI_MODEL,
+            escuelaId: meta.escuelaId || null, maestroId: meta.maestroId || null,
+            tipo: meta.tipo || 'estudiar', modelo: GEMINI_MODEL,
             tokensInput, tokensOutput, tokensTotal: tokensInput + tokensOutput, costoUSD
         }).catch(() => {});
     }
@@ -654,17 +805,19 @@ async function geminiCall(messages, jsonMode = false, meta = {}) {
 }
 
 async function groqCall(messages, jsonMode = false, meta = {}) {
-    const body = { model: GROQ_MODEL, messages, temperature: 0.7, max_tokens: 4096 };
+    const maxOut = Math.min(TOKEN_LIMITS[meta.tipo] || 4096, 4096); // GROQ max 4096
+    const body   = { model: GROQ_MODEL, messages, temperature: 0.7, max_tokens: maxOut };
     if (jsonMode) body.response_format = { type: 'json_object' };
+
     const response = await axios.post(
         'https://api.groq.com/openai/v1/chat/completions', body,
-        { headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+        { headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' }, timeout: 45000 }
     );
     const usage = response.data.usage || {};
     const tokensInput  = usage.prompt_tokens    || 0;
     const tokensOutput = usage.completion_tokens || 0;
     const costoUSD = (tokensInput * 0.00000059) + (tokensOutput * 0.00000079);
-    if (mongoose.connection.readyState) {
+    if (mongoose.connection.readyState && (tokensInput + tokensOutput) > 0) {
         UsageLog.create({
             escuelaId: meta.escuelaId || null, maestroId: meta.maestroId || null,
             tipo: meta.tipo || 'estudiar', modelo: GROQ_MODEL,
@@ -676,121 +829,252 @@ async function groqCall(messages, jsonMode = false, meta = {}) {
 
 const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
 
-// ══ EXTRACCIÓN WEB MEJORADA ══
+// ══════════════════════════════════════════════════════════════
+//  SISTEMA DE EXTRACCIÓN INTELIGENTE CON GEMINI GROUNDING
+// ══════════════════════════════════════════════════════════════
 
-// Detectar si es YouTube y extraer transcript/info
 function esYoutube(url) {
-    return /youtube\.com|youtu\.be/.test(url);
+    return /(?:youtube\.com\/(?:watch|shorts|embed|live)|youtu\.be\/)/.test(url);
 }
 function extraerYoutubeId(url) {
-    const m = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+    const m = url.match(/(?:[?&]v=|youtu\.be\/|\/embed\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})/);
     return m ? m[1] : null;
 }
 
+// ── Gemini con Google Search grounding — lee CUALQUIER URL en tiempo real
+async function extraerConGeminiGrounding(url) {
+    if (!GEMINI_KEY) return null;
+    const esVideo = esYoutube(url);
+    const videoId = esVideo ? extraerYoutubeId(url) : null;
+
+    const prompt = esVideo
+        ? `Accede y transcribe el contenido educativo de este video de YouTube: ${url}\n\nExtrae todos los conceptos, explicaciones, ejemplos y conclusiones del video. Si no puedes acceder directamente, busca información sobre el tema del video y genera contenido educativo equivalente. URL: ${url}`
+        : `Accede y extrae el contenido educativo completo de esta URL: ${url}\n\nSi el sitio requiere suscripción o está bloqueado, busca el mismo contenido en fuentes libres (Wikipedia, Khan Academy, artículos académicos gratuitos) y proporciona información equivalente de alta calidad.\nExtrae: títulos, definiciones, explicaciones, ejemplos, datos importantes.\nDevuelve SOLO el contenido educativo, sin navegación ni publicidad.`;
+
+    try {
+        const body = {
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
+            safetySettings: [{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" }]
+        };
+        const resp = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+            body, { headers: { "Content-Type": "application/json" }, timeout: 60000 }
+        );
+        const candidate = resp.data.candidates?.[0];
+        const texto = candidate?.content?.parts?.map(p => p.text || "").join("").trim();
+        if (texto && texto.length > 200) {
+            console.log(`✅ Gemini Grounding: ${texto.length} chars`);
+            const usage = resp.data.usageMetadata || {};
+            if (mongoose.connection.readyState) {
+                UsageLog.create({ tipo: "estudiar", modelo: GEMINI_MODEL + "-grounding",
+                    tokensInput: usage.promptTokenCount || 0,
+                    tokensOutput: usage.candidatesTokenCount || 0,
+                    tokensTotal: (usage.promptTokenCount||0)+(usage.candidatesTokenCount||0),
+                    costoUSD: ((usage.promptTokenCount||0)*0.000000075)+((usage.candidatesTokenCount||0)*0.0000003)
+                }).catch(()=>{});
+            }
+            return { texto, videoId, esVideo };
+        }
+    } catch(e) { console.warn("Gemini Grounding falló:", e.message); }
+    return null;
+}
+
+// ── YouTube: transcript + múltiples fallbacks
 async function extraerTextoYoutube(url) {
     const videoId = extraerYoutubeId(url);
-    if (!videoId) throw new Error('No se pudo identificar el video de YouTube.');
+    if (!videoId) throw new Error("No se pudo identificar el video de YouTube.");
 
-    // Intentar obtener transcript via API de terceros (gratuita)
-    try {
-        const transcriptRes = await axios.get(
-            `https://yt-transcript-api.vercel.app/api/transcript?videoId=${videoId}&lang=es`,
-            { timeout: 10000 }
-        ).catch(() => null);
+    // 1. Gemini Grounding (más confiable)
+    const geminiResult = await extraerConGeminiGrounding(url);
+    if (geminiResult) return geminiResult;
 
-        if (transcriptRes?.data?.transcript?.length) {
-            const texto = transcriptRes.data.transcript.map(t => t.text).join(' ');
-            return { texto, videoId, esVideo: true };
-        }
-    } catch {}
-
-    // Fallback: obtener título y descripción via oEmbed
-    try {
-        const oEmbed = await axios.get(
-            `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`,
-            { timeout: 8000 }
-        );
-        const titulo = oEmbed.data.title || 'Video de YouTube';
-        const autor  = oEmbed.data.author_name || '';
-        return {
-            texto: `Video de YouTube: "${titulo}" por ${autor}. Este es un video educativo sobre el tema mencionado en el título.`,
-            videoId, esVideo: true, titulo, autor
-        };
-    } catch {}
-
-    return { texto: `Video de YouTube (ID: ${videoId}). Genera contenido educativo basado en el tema del video.`, videoId, esVideo: true };
-}
-
-async function extraerTextoWeb(url) {
-    // YouTube: manejo especial
-    if (esYoutube(url)) {
-        const result = await extraerTextoYoutube(url);
-        return result; // retorna objeto {texto, videoId, esVideo}
-    }
-
-    // 1. Intentar Jina.ai Reader — bypass de paywalls y JS rendering
-    try {
-        const jinaRes = await axios.get(`https://r.jina.ai/${url}`, {
-            timeout: 20000,
-            headers: {
-                'Accept': 'text/plain',
-                'X-Return-Format': 'text',
-                'X-Timeout': '15'
-            }
-        });
-        if (jinaRes.data && jinaRes.data.length > 300) {
-            // Limpiar el texto de Jina
-            const texto = jinaRes.data
-                .replace(/^Title:.*\n/m, '')
-                .replace(/^URL Source:.*\n/m, '')
-                .replace(/^Markdown Content:/m, '')
-                .replace(/!\[.*?\]\(.*?\)/g, '') // imágenes markdown
-                .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1') // links markdown → solo texto
-                .replace(/#{1,6}\s/g, '') // headers
-                .replace(/\n{3,}/g, '\n\n')
-                .trim();
-            if (texto.length > 300) return texto;
-        }
-    } catch(e) {
-        console.log('Jina.ai falló, intentando scraping directo:', e.message);
-    }
-
-    // 2. Scraping directo como fallback
-    try {
-        const response = await axios.get(url, {
-            responseType: 'arraybuffer', timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120',
-                'Accept': 'text/html,application/xhtml+xml',
-                'Accept-Language': 'es-MX,es;q=0.9,en;q=0.8'
-            }
-        });
-        const ct = response.headers['content-type'] || '';
-        if (ct.includes('application/pdf')) return (await pdfParse(response.data)).text;
-        if (ct.includes('text/html')) {
-            const $ = cheerio.load(response.data.toString('utf-8'));
-            $('script,style,nav,footer,aside,header,iframe,noscript,.ad,.ads,.advertisement,.sidebar,.menu,.navbar,.cookie,.popup,.modal,form,button').remove();
-            const mainContent = $('article, main, .content, .post, .entry, #content, #main, .article-body, [role=main]').text();
-            if (mainContent.trim().length > 200) return mainContent.replace(/\s+/g,' ').trim();
-            return $('h1,h2,h3,h4,p,li,td,th,blockquote').text().replace(/\s+/g,' ').trim();
-        }
-        return response.data.toString('utf-8').substring(0, 20000);
-    } catch(e) {
-        // 3. Último fallback — Wayback Machine
+    // 2. APIs de transcript
+    const transcriptApis = [
+        `https://yt-transcript-api.vercel.app/api/transcript?videoId=${videoId}&lang=es`,
+        `https://yt-transcript-api.vercel.app/api/transcript?videoId=${videoId}&lang=en`,
+        `https://api.kome.ai/api/tools/youtube-transcripts?video_id=${videoId}`,
+    ];
+    for (const apiUrl of transcriptApis) {
         try {
-            const wbRes = await axios.get(`https://archive.org/wayback/available?url=${encodeURIComponent(url)}`, { timeout: 8000 });
-            const snap = wbRes.data?.archived_snapshots?.closest;
-            if (snap?.url) {
-                const archiveRes = await axios.get(snap.url, { timeout: 15000,
-                    headers: { 'User-Agent': 'Mozilla/5.0' } });
-                const $ = cheerio.load(archiveRes.data);
-                $('script,style,nav,footer').remove();
-                return $('p,h1,h2,h3,li').text().replace(/\s+/g,' ').trim().substring(0, 20000);
+            const r = await axios.get(apiUrl, { timeout: 10000 }).catch(() => null);
+            const transcript = r?.data?.transcript || r?.data?.transcripts || r?.data;
+            if (Array.isArray(transcript) && transcript.length > 5) {
+                const texto = transcript.map(t => t.text || t.content || "").filter(Boolean).join(" ");
+                if (texto.length > 200) { console.log(`✅ Transcript API: ${texto.length} chars`); return { texto, videoId, esVideo: true }; }
             }
         } catch {}
-        throw new Error("No se pudo acceder al contenido. Intenta copiar y pegar el texto directamente.");
     }
+
+    // 3. Jina.ai para página de YouTube
+    try {
+        const j = await axios.get(`https://r.jina.ai/https://www.youtube.com/watch?v=${videoId}`, {
+            timeout: 12000, headers: { "Accept": "text/plain" }
+        });
+        if (j.data?.length > 100) return { texto: j.data.substring(0, 6000), videoId, esVideo: true };
+    } catch {}
+
+    // 4. oEmbed fallback
+    try {
+        const oe = await axios.get(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, { timeout: 8000 });
+        const titulo = oe.data.title || "Video educativo";
+        return { texto: `Video: "${titulo}" por ${oe.data.author_name || ""}. Genera una clase magistral completa sobre el tema: "${titulo}".`, videoId, esVideo: true };
+    } catch {}
+
+    return { texto: `Video YouTube ID: ${videoId}. Genera contenido educativo completo sobre el tema de este video.`, videoId, esVideo: true };
 }
+
+// ── Extracción web — cascada de 4 métodos
+async function extraerTextoWeb(url) {
+    if (!url.startsWith("http")) url = "https://" + url;
+    if (esYoutube(url)) return await extraerTextoYoutube(url);
+
+    // 1. Gemini Grounding (puede leer paywalls y sitios con JS pesado)
+    const gr = await extraerConGeminiGrounding(url);
+    if (gr) return gr.texto;
+
+    // 2. Jina.ai Reader
+    try {
+        const j = await axios.get(`https://r.jina.ai/${url}`, {
+            timeout: 20000,
+            headers: { "Accept": "text/plain", "X-Return-Format": "markdown", "X-Timeout": "18",
+                       "X-Remove-Selector": "header,footer,nav,.ad,.cookie,.popup,.modal,.sidebar,aside" }
+        });
+        if (j.data?.length > 400) {
+            const texto = j.data
+                .replace(/^(Title|URL Source|Published Time|Description|Markdown Content):.+$/gm, "")
+                .replace(/!\[.*?\]\(.*?\)/g, "").replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
+                .replace(/^#{1,6}\s+/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+            if (texto.length > 400) { console.log(`✅ Jina.ai: ${texto.length} chars`); return texto; }
+        }
+    } catch(e) { console.log("Jina.ai falló:", e.message); }
+
+    // 3. Scraping directo con cheerio
+    try {
+        const response = await axios.get(url, {
+            responseType: "arraybuffer", timeout: 15000, maxRedirects: 5,
+            headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                       "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8" }
+        });
+        const ct = response.headers["content-type"] || "";
+        if (ct.includes("application/pdf")) {
+            const txt = (await pdfParse(response.data)).text;
+            if (txt.length > 100) return txt;
+        }
+        if (ct.includes("text/html") || ct.includes("application/xhtml")) {
+            const $ = cheerio.load(response.data.toString("utf-8"));
+            $("script,style,nav,footer,aside,header,iframe,noscript,.ad,.ads,.sidebar,.menu,.cookie,.popup,.modal,.banner,.paywall").remove();
+            for (const sel of ["article","[role=main]","main",".article-body",".post-content",".entry-content",".content","#content","#main"]) {
+                const txt = $(sel).text().replace(/\s+/g," ").trim();
+                if (txt.length > 400) { console.log(`✅ Cheerio (${sel}): ${txt.length} chars`); return txt; }
+            }
+            const fb = $("h1,h2,h3,h4,p,li,td,th,blockquote").text().replace(/\s+/g," ").trim();
+            if (fb.length > 200) return fb;
+        }
+    } catch(e) { console.log("Scraping falló:", e.message); }
+
+    // 4. Wayback Machine
+    try {
+        const wb = await axios.get(`https://archive.org/wayback/available?url=${encodeURIComponent(url)}`, { timeout: 8000 });
+        const snap = wb.data?.archived_snapshots?.closest;
+        if (snap?.url) {
+            const ar = await axios.get(snap.url, { timeout: 20000, headers: { "User-Agent": "Mozilla/5.0" } });
+            const $ = cheerio.load(ar.data);
+            $("script,style,nav,footer,#wm-ipp,#wm-ipp-base").remove();
+            const txt = $("article,main,p").text().replace(/\s+/g," ").trim();
+            if (txt.length > 300) { console.log(`✅ Wayback: ${txt.length} chars`); return txt.substring(0, 20000); }
+        }
+    } catch {}
+
+    throw new Error(`No se pudo leer: ${url}\n\n💡 Opciones:\n• Pega el texto directamente\n• Usa Wikipedia, Khan Academy o YouTube del mismo tema\n• Si es PDF, súbelo en "Foto/PDF"`);
+}
+
+// ── Búsqueda de recursos educativos con Gemini Grounding
+async function buscarRecursosEducativosIA(tema) {
+    if (!GEMINI_KEY) return null;
+    try {
+        const body = {
+            contents: [{ role: "user", parts: [{ text:
+`Busca recursos educativos REALES y actuales en español sobre: "${tema}"
+
+Encuentra específicamente:
+1. Videos de YouTube de canales educativos confiables (DW, BBC, TED-Ed, Khan Academy, UNAM, Kurzgesagt, Crash Course, etc.)
+2. Artículos de fuentes serias (Wikipedia, Khan Academy, National Geographic, Britannica, gov.mx, UNAM)
+3. PDFs o documentos académicos gratuitos si existen
+
+Responde SOLO con este JSON exacto (sin texto extra):
+{"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=...","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}
+
+Solo incluye URLs que realmente existan y sean accesibles. Verifica que los IDs de YouTube sean válidos.`
+            }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: "application/json" }
+        };
+        const resp = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+            body, { headers: { "Content-Type": "application/json" }, timeout: 45000 }
+        );
+        const texto = resp.data.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("").trim();
+        if (!texto) return null;
+        return JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim());
+    } catch(e) { console.warn("Búsqueda recursos IA falló:", e.message); return null; }
+}
+
+// ── Generar clase directamente con búsqueda (cuando URL falla o es solo un tema)
+async function generarDesdeTemaBuscado(temaOUrl, meta = {}) {
+    if (!GEMINI_KEY) throw new Error("Se requiere GEMINI_API_KEY para búsqueda de contenido.");
+
+    let tema = temaOUrl;
+    try {
+        const u = new URL(temaOUrl);
+        const q = u.searchParams.get("q") || u.searchParams.get("search");
+        tema = q || u.pathname.split("/").filter(Boolean).slice(-1)[0]?.replace(/[-_]/g," ") || temaOUrl;
+    } catch {}
+
+    console.log(`🔍 Generando con búsqueda para: "${tema}"`);
+
+    const body = {
+        contents: [{ role: "user", parts: [{ text:
+`Eres un experto educador de preparatoria mexicano. Busca información actualizada y confiable sobre: "${tema}"
+
+Usa búsqueda para encontrar:
+- Definiciones precisas y actualizadas
+- Conceptos clave del tema
+- Ejemplos concretos y reales
+- Datos históricos o científicos relevantes
+- Al menos 3-4 subtemas importantes
+
+Con esa información, crea una clase magistral COMPLETA para preparatoria (14-18 años).
+
+Responde SOLO con este JSON:
+{"titulo":"Título atractivo","resumen":"Clase magistral con <b>conceptos</b> en negritas y <br><br> entre párrafos... (mínimo 6 párrafos ricos)","podcast":"Guión conversacional 300-400 palabras...","quiz":[{"p":"Pregunta 1","o":["A","B","C","D"],"r":0},{"p":"P2","o":["A","B","C","D"],"r":1},{"p":"P3","o":["A","B","C","D"],"r":2},{"p":"P4","o":["A","B","C","D"],"r":3},{"p":"P5","o":["A","B","C","D"],"r":0},{"p":"P6","o":["A","B","C","D"],"r":2}],"flashcards":[{"anverso":"Concepto","reverso":"Def+ejemplo+importancia"},{"anverso":"C2","reverso":"..."},{"anverso":"C3","reverso":"..."},{"anverso":"C4","reverso":"..."},{"anverso":"C5","reverso":"..."},{"anverso":"C6","reverso":"..."},{"anverso":"C7","reverso":"..."},{"anverso":"C8","reverso":"..."}],"fuentes":["fuente1","fuente2","fuente3"]}`
+        }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8192, responseMimeType: "application/json" },
+        safetySettings: [{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" }]
+    };
+
+    const resp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+        body, { headers: { "Content-Type": "application/json" }, timeout: 90000 }
+    );
+    const usage = resp.data.usageMetadata || {};
+    if (mongoose.connection.readyState) {
+        UsageLog.create({ ...meta, tipo: meta.tipo||"estudiar", modelo: GEMINI_MODEL+"-search",
+            tokensInput: usage.promptTokenCount||0, tokensOutput: usage.candidatesTokenCount||0,
+            tokensTotal: (usage.promptTokenCount||0)+(usage.candidatesTokenCount||0),
+            costoUSD: ((usage.promptTokenCount||0)*0.000000075)+((usage.candidatesTokenCount||0)*0.0000003)
+        }).catch(()=>{});
+    }
+    const texto = resp.data.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("").trim();
+    if (!texto) throw new Error("Gemini no retornó contenido.");
+    const data = JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim());
+    data.contexto = `Generado con búsqueda sobre: "${tema}"`;
+    data.generadaConBusqueda = true;
+    return data;
+}
+
 const usageLogSchema = new mongoose.Schema({
     escuelaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
     maestroId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true, default: null },
@@ -977,10 +1261,24 @@ app.post('/api/estudiar', verifyAlumno, checkLimiteDiario, async (req, res) => {
     try {
         const { input } = req.body;
         if (!input) return res.status(400).json({ error: "Falta contenido." });
-        const meta = { alumnoId: req.alumno?.id };
+        const meta = { alumnoId: req.alumno?.id, tipo: 'estudiar' };
         let fuente = input.trim();
-        // extraerTextoWeb retorna string o {texto, videoId, esVideo} para YouTube
-        if (fuente.startsWith('http')) fuente = await extraerTextoWeb(fuente);
+
+        if (fuente.startsWith('http')) {
+            try {
+                // Intentar extraer el contenido de la URL
+                fuente = await extraerTextoWeb(fuente);
+            } catch(extractErr) {
+                console.warn('Extracción falló, intentando generar con búsqueda:', extractErr.message);
+                // Si la URL falla, generar directamente con Gemini Grounding
+                if (GEMINI_KEY) {
+                    const data = await generarDesdeTemaBuscado(input.trim(), meta);
+                    return res.json(data);
+                }
+                return res.status(422).json({ error: extractErr.message });
+            }
+        }
+
         res.json(await procesarConIA(fuente, meta));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1139,59 +1437,78 @@ ${contextoGrupo}` },
 });
 
 // ══ CHAT DIRECTOR — SOLO datos reales de la institución ══
+
+// ══ CHAT DIRECTOR — con contexto de toda la institución ══
 app.post('/api/director/chat', verifyDirector, async (req, res) => {
     try {
         const { pregunta, historial } = req.body;
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
 
-        let contextoInst = 'Sin datos disponibles.';
-        if (mongoose.connection.readyState) {
+        // Datos REALES de la institución del director (no de toda la BD)
+        const escuelaId = req.director.escuelaId;
+        let ctx = 'Sin datos disponibles aún.';
+
+        if (mongoose.connection.readyState && escuelaId) {
             const hace30 = new Date(Date.now()-30*24*60*60*1000);
             const hace7  = new Date(Date.now()-7*24*60*60*1000);
-            const hoyD   = new Date(new Date().setHours(0,0,0,0));
+            const hoy    = new Date(new Date().setHours(0,0,0,0));
 
-            const [totMaestros, totAlumnos, ses30, ses7, sesToday] = await Promise.all([
-                Maestro.countDocuments(),
-                Alumno.countDocuments({activo:true}),
-                Sesion.countDocuments({creadoEn:{$gte:hace30}}),
-                Sesion.countDocuments({creadoEn:{$gte:hace7}}),
-                Sesion.countDocuments({creadoEn:{$gte:hoyD}})
+            const maestros   = await Maestro.find({ escuelaId }).select('nombre email').lean();
+            const maestroIds = maestros.map(m => m._id);
+            const grupos     = await Grupo.find({ maestroId: { $in: maestroIds } }).select('nombre materia semestre').lean();
+            const grupoIds   = grupos.map(g => g._id);
+            const alumnos    = await Alumno.find({ grupoId: { $in: grupoIds }, activo: true }).select('nombre grupoId logros').lean();
+
+            const [ses30, ses7, sesToday] = await Promise.all([
+                Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace30 } }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace7 } }),
+                Sesion.countDocuments({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hoy } })
             ]);
 
-            const muestra = await Sesion.find({creadoEn:{$gte:hace30}}).select('pct nombre creadoEn').lean().limit(500);
+            const muestra = await Sesion.find({ grupoId: { $in: grupoIds }, creadoEn: { $gte: hace30 } })
+                .select('nombre pct creadoEn grupoId').lean().limit(600);
             const prom = muestra.length ? Math.round(muestra.reduce((a,s)=>a+(s.pct||0),0)/muestra.length) : 0;
 
-            // Alumnos en riesgo
+            // Riesgo: alumnos con promedio <60 en últimas 3 sesiones
             const alumMap = {};
-            muestra.forEach(s=>{ if(!alumMap[s.nombre]) alumMap[s.nombre]=[]; alumMap[s.nombre].push(s.pct||0); });
+            muestra.forEach(s => { if(!alumMap[s.nombre]) alumMap[s.nombre]=[]; alumMap[s.nombre].push(s.pct||0); });
             const riesgo = Object.entries(alumMap)
-                .filter(([,ps])=>ps.length>=2 && ps.reduce((a,b)=>a+b,0)/ps.length < 60)
-                .map(([n,ps])=>`${n} (${Math.round(ps.reduce((a,b)=>a+b,0)/ps.length)}%)`);
+                .filter(([,ps])=>ps.length>=2 && ps.slice(0,3).reduce((a,b)=>a+b,0)/Math.min(3,ps.length)<60)
+                .map(([n,ps])=>`${n}(${Math.round(ps.slice(0,3).reduce((a,b)=>a+b,0)/Math.min(3,ps.length))}%)`);
 
-            const grupos = await Grupo.find({}).select('nombre semestre materia').lean();
+            // Maestros activos esta semana
+            const maestrosActivos = await Promise.all(maestros.map(async m => {
+                const gids = grupos.filter(g=>String(g.maestroId||'')===String(m._id)).map(g=>g._id);
+                const cnt  = await Sesion.countDocuments({ grupoId:{$in:gids}, creadoEn:{$gte:hace7} });
+                return { nombre: m.nombre, sesiones7d: cnt };
+            }));
+            const topMaestros = [...maestrosActivos].sort((a,b)=>b.sesiones7d-a.sesiones7d).slice(0,3);
+            const sinActividad = maestrosActivos.filter(m=>m.sesiones7d===0).map(m=>m.nombre);
 
-            contextoInst = `DATOS INSTITUCIÓN (30 días):
-• Maestros: ${totMaestros}, Alumnos activos: ${totAlumnos}
-• Sesiones: hoy=${sesToday}, semana=${ses7}, mes=${ses30}
-• Promedio institucional: ${prom}%
-• Alumnos en riesgo (<60%): ${riesgo.length} — ${riesgo.slice(0,8).join(', ')||'ninguno'}
-• Grupos activos: ${grupos.map(g=>`${g.nombre}(${g.materia})`).join(', ')||'ninguno'}`;
+            ctx = `INSTITUCIÓN: ${await Escuela.findById(escuelaId).select('nombre').lean().then(e=>e?.nombre||'')}
+MAESTROS: ${maestros.length} | GRUPOS: ${grupos.length} | ALUMNOS: ${alumnos.length}
+SESIONES: hoy=${sesToday}, semana=${ses7}, mes30=${ses30}
+PROMEDIO INSTITUCIONAL: ${prom}%
+ALUMNOS EN RIESGO (<60%): ${riesgo.length} → ${riesgo.slice(0,8).join(', ')||'ninguno'}
+MAESTROS MÁS ACTIVOS (7d): ${topMaestros.map(m=>`${m.nombre}(${m.sesiones7d} ses)`).join(', ')||'—'}
+MAESTROS SIN ACTIVIDAD ESTA SEMANA: ${sinActividad.join(', ')||'ninguno'}
+GRUPOS: ${grupos.map(g=>`${g.nombre}/${g.materia}`).join(', ')}`;
         }
 
         const histMsgs = (historial||[]).slice(-8).map(m=>({ role: m.role==='director'?'user':'assistant', content: m.texto }));
 
         const messages = [
-            { role: 'system', content: `Eres un asistente estratégico para directores educativos. Analizas ÚNICAMENTE los datos reales de la institución.
+            { role: 'system', content: `Eres un asistente estratégico exclusivo para el director de esta institución educativa. Solo tienes acceso a los datos de SU institución.
 
-REGLAS ESTRICTAS:
-- SOLO usa los datos proporcionados. NUNCA inventes métricas o alumnos.
-- Si no hay datos suficientes para responder, dilo claramente
-- Respuestas ejecutivas: directas, con datos, sin relleno
-- Máximo 5 puntos o 3 párrafos concisos
-- Si preguntan algo fuera del ámbito institucional-educativo, declina
+REGLAS:
+- SOLO usa los datos proporcionados. NUNCA inventes métricas
+- Si no hay datos suficientes, dilo claramente
+- Respuestas ejecutivas: máx 4 puntos concisos
+- Si preguntan algo ajeno al ámbito educativo-institucional, declina
+- Propón acciones concretas con nombres reales cuando los tengas
 
-DATOS REALES:
-${contextoInst}` },
+DATOS REALES DE LA INSTITUCIÓN:
+${ctx}` },
             ...histMsgs,
             { role: 'user', content: pregunta }
         ];
@@ -1200,71 +1517,6 @@ ${contextoInst}` },
         res.json({ answer });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
-    try {
-        const { context, question, sesionData, historial } = req.body;
-        if (!question) return res.status(400).json({ error: 'Falta la pregunta.' });
-
-        // Construir contexto rico: resumen + flashcards + quiz
-        let contextoCompleto = context || '';
-        if (sesionData) {
-            const { titulo, resumen, flashcards, quiz, podcast } = sesionData;
-            contextoCompleto = `
-TEMA DE LA CLASE: ${titulo || ''}
-
-RESUMEN DE LA CLASE:
-${(resumen || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()}
-
-${flashcards?.length ? `CONCEPTOS CLAVE:
-${flashcards.map(f => `• ${f.anverso}: ${f.reverso || f.definicion || ''}`).join('\n')}` : ''}
-
-${quiz?.length ? `PREGUNTAS DEL QUIZ (para referencia):
-${quiz.map((q, i) => `${i+1}. ${q.p} → Respuesta: ${q.o?.[q.r] || ''}`).join('\n')}` : ''}
-
-${podcast ? `GUIÓN DEL PODCAST:\n${podcast.substring(0, 1000)}` : ''}`.trim();
-        }
-
-        // Historial multi-turno
-        const mensajesHistorial = (historial || []).slice(-10).map(m => ({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.texto
-        }));
-
-        const messages = [
-            {
-                role: 'system',
-                content: `Eres un tutor inteligente y amable para estudiantes de preparatoria mexicana. Tienes acceso completo al material de la clase que el alumno acaba de estudiar.
-
-REGLAS IMPORTANTES:
-- Responde SIEMPRE en español, de forma clara y motivadora
-- Usa el contenido de la clase para dar respuestas precisas y específicas
-- Si la pregunta es sobre algo en la clase, cita el contenido exacto
-- Si el alumno no entendió algo, explícalo con una analogía diferente
-- Máximo 3-4 párrafos por respuesta — conciso y claro
-- NUNCA respondas sobre temas no educativos, violencia, política o contenido inapropiado
-- Usa emojis con moderación para hacer la respuesta más visual
-- Si el alumno se equivocó en algo, corrígelo con amabilidad
-
-${contextoCompleto ? `\n=== MATERIAL DE LA CLASE ===\n${contextoCompleto}\n=== FIN DEL MATERIAL ===` : ''}`
-            },
-            ...mensajesHistorial,
-            { role: 'user', content: question }
-        ];
-
-        const answer = await iaCall(messages, false, { tipo: 'chat' });
-        res.json({ answer });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ══ CHAT DIRECTOR — con contexto de toda la institución ══
-app.post('/api/director/chat', verifyDirector, async (req, res) => {
-    try {
-        const { pregunta, historial } = req.body;
-        if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
-
-        let contextoInstitucion = '';
-        if (mongoose.connection.readyState) {
-            const grupoIds = await Grupo.find({}).select('_id');
-            const ids = grupoIds.map(g => g._id);
             const hace30 = new Date(Date.now() - 30*24*60*60*1000);
             const hace7  = new Date(Date.now() - 7*24*60*60*1000);
             const hoy    = new Date(new Date().setHours(0,0,0,0));
@@ -1507,94 +1759,75 @@ app.get('/api/maestro/analytics/:grupoId', verifyToken, async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ══ CHAT DEL MAESTRO — con contexto de datos del grupo ══
-app.post('/api/maestro/chat', verifyToken, async (req, res) => {
+// ══ BÚSQUEDA DE RECURSOS EDUCATIVOS — GEMINI GROUNDING ══
+app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
     try {
-        const { grupoId, pregunta, historial } = req.body;
-        if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+        const { tema } = req.body;
+        if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
 
-        // Construir contexto del grupo si se proporciona
-        let contextoGrupo = '';
-        if (grupoId && mongoose.connection.readyState) {
-            const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id }).select('nombre semestre materia');
-            if (grupo) {
-                const sesiones = await Sesion.find({ grupoId })
-                    .sort({ creadoEn: -1 })
-                    .select('nombre pct correctas total creadoEn respuestasQuiz escuchoPodcast')
-                    .limit(200);
+        // Intentar con Gemini Grounding primero (encuentra recursos REALES y actuales)
+        if (GEMINI_KEY) {
+            const recursos = await buscarRecursosEducativosIA(tema);
+            if (recursos && (recursos.videos?.length || recursos.articulos?.length)) {
+                // Construir respuesta compatible con el frontend
+                const paraTarea = [];
+                const materialExtra = [];
 
-                const hace7dias = new Date(Date.now() - 7*24*60*60*1000);
-                const alumnosMap = {};
-                [...sesiones].reverse().forEach(s => {
-                    if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = { nombre: s.nombre, sesiones:[], pctTotal:0 };
-                    alumnosMap[s.nombre].sesiones.push({ pct: s.pct, fecha: s.creadoEn });
-                    alumnosMap[s.nombre].pctTotal += (s.pct||0);
-                });
-                const alumnos = Object.values(alumnosMap).map(a => {
-                    const prom = Math.round(a.pctTotal / a.sesiones.length);
-                    const sems = a.sesiones.filter(s => new Date(s.fecha) >= hace7dias).length;
-                    const ult = a.sesiones[a.sesiones.length-1];
-                    const ant = a.sesiones[a.sesiones.length-2];
-                    const tend = ult && ant ? ult.pct - ant.pct : 0;
-                    const diasInact = ult ? Math.floor((Date.now()-new Date(ult.fecha))/86400000) : 999;
-                    return `- ${a.nombre}: promedio ${prom}%, ${a.sesiones.length} sesiones totales, ${sems} esta semana, tendencia ${tend>=0?'+':''}${tend}pts, última actividad hace ${diasInact} días`;
+                (recursos.articulos || []).forEach(a => {
+                    paraTarea.push({
+                        titulo: a.titulo, fuente: a.fuente, tipo: 'Artículo',
+                        nivel: 'Preparatoria', descripcion: a.descripcion,
+                        url: a.url, idioma: 'Español', procesable: true,
+                        esVideo: false, urlActiva: true
+                    });
                 });
 
-                const fallosMap = {};
-                sesiones.forEach(s => (s.respuestasQuiz||[]).forEach(r => {
-                    if (!r.esCorrecta) fallosMap[r.pregunta] = (fallosMap[r.pregunta]||0)+1;
-                }));
-                const topFallos = Object.entries(fallosMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([p,v])=>`"${p}" (${v}x)`);
+                (recursos.videos || []).forEach(v => {
+                    materialExtra.push({
+                        titulo: v.titulo, fuente: v.canal || 'YouTube',
+                        tipo: 'Video', nivel: 'Preparatoria',
+                        descripcion: `${v.descripcion}${v.duracion ? ' · ' + v.duracion : ''}`,
+                        url: v.url, idioma: 'Español', procesable: false,
+                        esVideo: true, urlActiva: true
+                    });
+                });
 
-                const promGrupo = sesiones.length ? Math.round(sesiones.reduce((a,s)=>a+(s.pct||0),0)/sesiones.length) : 0;
-                const semsTotal = sesiones.filter(s => new Date(s.creadoEn) >= hace7dias).length;
-
-                contextoGrupo = `
-GRUPO: ${grupo.nombre} | ${grupo.materia} | ${grupo.semestre}
-ESTADÍSTICAS DEL GRUPO:
-- Promedio general: ${promGrupo}%
-- Total de entregas: ${sesiones.length} (${semsTotal} esta semana)
-- Total alumnos únicos: ${alumnos.length}
-
-ALUMNOS (ordenados por promedio desc):
-${alumnos.sort((a,b) => {
-    const pa = parseInt(a.match(/promedio (\d+)/)?.[1]||0);
-    const pb = parseInt(b.match(/promedio (\d+)/)?.[1]||0);
-    return pb - pa;
-}).join('\n')}
-
-TEMAS MÁS FALLADOS: ${topFallos.join(' | ') || 'Sin datos suficientes'}`;
+                return res.json({
+                    recursos: [...paraTarea, ...materialExtra],
+                    paraTarea,
+                    materialExtra,
+                    consejo: `Recursos encontrados en tiempo real para "${tema}". Los artículos puedes procesarlos directamente en Tutor IA. Los videos son del tema exacto.`,
+                    consultasSugeridas: recursos.consultas_sugeridas || [],
+                    fuenteIA: 'google_search'
+                });
             }
         }
 
-        // Construir historial de mensajes para contexto multi-turno
-        const mensajesHistorial = (historial||[]).slice(-8).map(m => ({
-            role: m.role === 'maestro' ? 'user' : 'assistant',
-            content: m.texto
-        }));
+        // Fallback: generación sin búsqueda (modo antiguo mejorado)
+        const text = await iaCall([
+            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido.' },
+            { role: 'user', content:
+`Recursos educativos de ALTA CALIDAD para preparatoria en México sobre: "${tema}".
 
-        const messages = [
-            { role: 'system', content: `Eres un asistente pedagógico experto para maestros de preparatoria. Tu rol es analizar datos de desempeño de alumnos y dar consejos ACCIONABLES, concretos y con nombres reales.
+URLs SEGURAS solamente:
+- Wikipedia: https://es.wikipedia.org/wiki/${encodeURIComponent(tema.replace(/ /g,'_'))}
+- Khan Academy: https://es.khanacademy.org/search?page_search_query=${encodeURIComponent(tema)}
+- YouTube búsqueda: https://www.youtube.com/results?search_query=${encodeURIComponent(tema + ' educativo español')}
+- Google Académico: https://scholar.google.com/scholar?q=${encodeURIComponent(tema)}
 
-REGLAS:
-- Respuestas máximo 3-4 párrafos cortos o listas breves
-- Siempre usa los nombres reales de los alumnos cuando los tienes
-- Da recomendaciones pedagógicas específicas (no genéricas)
-- Si te piden recursos, sugiere estrategias de búsqueda concretas
-- Habla directamente al maestro (tutéalo)
-- Si no tienes datos de un grupo, dilo y ofrece consejos generales
-${contextoGrupo ? `\nDATOS ACTUALES DEL GRUPO:\n${contextoGrupo}` : ''}` },
-            ...mensajesHistorial,
-            { role: 'user', content: pregunta }
-        ];
+Responde JSON:
+{"recursos":[{"titulo":"...","fuente":"...","tipo":"Artículo","nivel":"Preparatoria","descripcion":"...","url":"https://...","idioma":"Español","procesable":true,"esVideo":false}],"consejo":"..."}`
+            }
+        ], true);
 
-        const answer = await iaCall(messages);
-        res.json({ answer });
+        const data = JSON.parse(text);
+        const recursos = (data.recursos || []).map(r => ({ ...r, urlActiva: true }));
+        data.paraTarea     = recursos.filter(r => r.procesable && !r.esVideo);
+        data.materialExtra = recursos.filter(r => !r.procesable || r.esVideo);
+        data.recursos      = recursos;
+        res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// ══ BÚSQUEDA DE RECURSOS EDUCATIVOS DE CALIDAD ══
-app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
     try {
         const { tema } = req.body;
         if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
@@ -3314,7 +3547,7 @@ app.get('/api/admin/stats-uso', verifyAdmin, async (req, res) => {
                 _id: null,
                 tokensTotal:  { $sum: '$tokensTotal' },
                 costoTotal:   { $sum: '$costoUSD' },
-                llamadas:     { $count: {} }
+                llamadas: { $sum: 1 }
             }}
         ]);
         const usage30d = usagePipeline[0] || { tokensTotal: 0, costoTotal: 0, llamadas: 0 };
@@ -3322,7 +3555,7 @@ app.get('/api/admin/stats-uso', verifyAdmin, async (req, res) => {
         // Uso por escuela
         const usagePorEscuela = await UsageLog.aggregate([
             { $match: { creadoEn: { $gte: hace30 }, escuelaId: { $ne: null } } },
-            { $group: { _id: '$escuelaId', tokens: { $sum: '$tokensTotal' }, costo: { $sum: '$costoUSD' }, llamadas: { $count: {} } } },
+            { $group: { _id: '$escuelaId', tokens: { $sum: '$tokensTotal' }, costo: { $sum: '$costoUSD' }, llamadas: { $sum: 1 } } },
             { $sort: { tokens: -1 } },
             { $limit: 10 }
         ]);
@@ -3339,7 +3572,7 @@ app.get('/api/admin/stats-uso', verifyAdmin, async (req, res) => {
             { $match: { creadoEn: { $gte: new Date(Date.now() - 14*24*60*60*1000) } } },
             { $group: {
                 _id: { $dateToString: { format: '%Y-%m-%d', date: '$creadoEn' } },
-                count: { $count: {} }
+                count: { $sum: 1 }
             }},
             { $sort: { _id: 1 } }
         ]);
@@ -3366,4 +3599,326 @@ app.get('/api/admin/stats-uso', verifyAdmin, async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`🚀 Tutor IA en puerto ${PORT} — modelo: ${GROQ_MODEL}`));
+// ══ RETO SEMANAL ══
+const retoSchema = new mongoose.Schema({
+    shortId:      { type: String, unique: true, index: true },
+    maestroId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true },
+    grupoId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    titulo:       String,
+    descripcion:  String,
+    preguntas:    [Object],     // pool mezclado
+    tiempoLimite: { type: Number, default: 30 },  // minutos
+    activo:       { type: Boolean, default: true },
+    fechaFin:     { type: Date },                 // cuándo expira
+    participantes: [{ // resultados de cada alumno
+        alumno:   String,
+        alumnoId: mongoose.Schema.Types.ObjectId,
+        pct:      Number,
+        correctas: Number,
+        total:    Number,
+        tiempo:   Number,       // segundos usados
+        completadoEn: { type: Date, default: Date.now }
+    }],
+    creadoEn: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 14 } // 14 días TTL
+});
+const Reto = mongoose.models.Reto || mongoose.model('Reto', retoSchema);
+
+// Crear reto semanal
+app.post('/api/maestro/reto', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { grupoId, tareaIds, titulo, descripcion, preguntasPorTarea, tiempoLimite, diasDuracion } = req.body;
+        if (!tareaIds?.length) return res.status(400).json({ error: 'Selecciona al menos una tarea.' });
+
+        const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id });
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+
+        const tareas = await Tarea.find({ _id: { $in: tareaIds }, maestroId: req.maestro.id }).lean();
+        if (!tareas.length) return res.status(404).json({ error: 'Tareas no encontradas.' });
+
+        const ppt = Math.min(preguntasPorTarea || 5, 10);
+        let preguntas = [];
+        tareas.forEach(t => {
+            const pool = (t.poolPreguntas || []).sort(() => Math.random() - 0.5).slice(0, ppt);
+            preguntas = preguntas.concat(pool.map(q => ({ ...q, fuente: t.titulo })));
+        });
+        preguntas = preguntas.sort(() => Math.random() - 0.5);
+
+        const dias = Math.min(diasDuracion || 7, 14);
+        const shortId = await shortIdUnico(Reto);
+        const reto = await Reto.create({
+            shortId, maestroId: req.maestro.id, grupoId,
+            titulo: titulo || `🏆 Reto Semanal — ${grupo.nombre}`,
+            descripcion: descripcion || `Demuestra todo lo que sabes. Tienes ${dias} día${dias>1?'s':''} para completarlo.`,
+            preguntas, tiempoLimite: tiempoLimite || 30,
+            activo: true,
+            fechaFin: new Date(Date.now() + dias * 24 * 60 * 60 * 1000),
+            participantes: []
+        });
+        res.json({ shortId: reto.shortId, titulo: reto.titulo, totalPreguntas: preguntas.length, fechaFin: reto.fechaFin });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Listar retos del maestro
+app.get('/api/maestro/retos', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const retos = await Reto.find({ maestroId: req.maestro.id })
+            .sort({ creadoEn: -1 }).select('-preguntas').lean();
+        res.json({ retos });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Obtener reto (alumno) — sin respuestas correctas
+app.get('/api/reto/:shortId', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const reto = await Reto.findOne({ shortId: req.params.shortId, activo: true }).lean();
+        if (!reto) return res.status(404).json({ error: 'Reto no encontrado o expirado.' });
+        if (reto.fechaFin && new Date() > new Date(reto.fechaFin))
+            return res.status(410).json({ error: 'Este reto ya expiró.' });
+
+        // Calcular ranking actual
+        const ranking = [...(reto.participantes || [])].sort((a,b) => {
+            if (b.pct !== a.pct) return b.pct - a.pct;
+            return a.tiempo - b.tiempo; // menor tiempo desempata
+        }).map((p, i) => ({ posicion: i+1, alumno: p.alumno, pct: p.pct, correctas: p.correctas, tiempo: p.tiempo }));
+
+        res.json({
+            shortId: reto.shortId, titulo: reto.titulo, descripcion: reto.descripcion,
+            totalPreguntas: reto.preguntas.length, tiempoLimite: reto.tiempoLimite,
+            fechaFin: reto.fechaFin, ranking,
+            preguntas: reto.preguntas.map(q => ({ p: q.p, o: q.o, fuente: q.fuente })) // sin q.r
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Entregar reto (alumno)
+app.post('/api/reto/:shortId/entregar', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { alumno, alumnoId, respuestas, tiempoUsado } = req.body;
+        if (!alumno) return res.status(400).json({ error: 'Falta el nombre del alumno.' });
+
+        const reto = await Reto.findOne({ shortId: req.params.shortId, activo: true });
+        if (!reto) return res.status(404).json({ error: 'Reto no encontrado.' });
+        if (reto.fechaFin && new Date() > new Date(reto.fechaFin))
+            return res.status(410).json({ error: 'Este reto ya expiró.' });
+
+        // Verificar si ya participó
+        const yaParticipó = reto.participantes.find(p => p.alumno === alumno);
+        if (yaParticipó) return res.status(409).json({
+            error: 'Ya completaste este reto.', pct: yaParticipó.pct, correctas: yaParticipó.correctas
+        });
+
+        // Calificar
+        let correctas = 0;
+        const detalles = reto.preguntas.map((q, i) => {
+            const esCorrecta = respuestas[i] === q.r;
+            if (esCorrecta) correctas++;
+            return { esCorrecta, correcta: q.r, seleccionada: respuestas[i], pregunta: q.p };
+        });
+        const total = reto.preguntas.length;
+        const pct   = Math.round((correctas / total) * 100);
+
+        reto.participantes.push({ alumno, alumnoId: alumnoId || null, pct, correctas, total, tiempo: tiempoUsado || 0 });
+        await reto.save();
+
+        // Ranking actualizado
+        const ranking = [...reto.participantes].sort((a,b) => b.pct-a.pct || a.tiempo-b.tiempo)
+            .map((p,i) => ({ posicion: i+1, alumno: p.alumno, pct: p.pct }));
+        const miPosicion = ranking.findIndex(r => r.alumno === alumno) + 1;
+
+        res.json({ pct, correctas, total, miPosicion, totalParticipantes: reto.participantes.length, detalles });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Resultados del reto para el maestro
+app.get('/api/maestro/reto/:shortId/resultados', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const reto = await Reto.findOne({ shortId: req.params.shortId, maestroId: req.maestro.id }).lean();
+        if (!reto) return res.status(404).json({ error: 'Reto no encontrado.' });
+
+        const ranking = [...(reto.participantes||[])].sort((a,b) => b.pct-a.pct || a.tiempo-b.tiempo)
+            .map((p,i) => ({ ...p, posicion: i+1 }));
+
+        const prom = ranking.length ? Math.round(ranking.reduce((a,r)=>a+r.pct,0)/ranking.length) : 0;
+        res.json({ reto: { ...reto, preguntas: undefined }, ranking, promedio: prom });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cerrar reto
+app.patch('/api/maestro/reto/:shortId/estado', verifyToken, async (req, res) => {
+    try {
+        const reto = await Reto.findOneAndUpdate(
+            { shortId: req.params.shortId, maestroId: req.maestro.id },
+            { activo: req.body.activo }, { new: true }
+        );
+        if (!reto) return res.status(404).json({ error: 'Reto no encontrado.' });
+        res.json({ ok: true, activo: reto.activo });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ PLAN DE ESTUDIO — 3 lecturas → examen automático ══
+// El maestro crea un "plan" con N tareas. Al completarlas todas, se genera el examen automáticamente.
+
+const planEstudioSchema = new mongoose.Schema({
+    shortId:       { type: String, unique: true, index: true },
+    maestroId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true },
+    grupoId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    titulo:        String,
+    descripcion:   String,
+    tareaIds:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'Tarea' }],
+    preguntasPorTarea: { type: Number, default: 5 },
+    tiempoLimiteMin:   { type: Number, default: 45 },
+    activo:        { type: Boolean, default: true },
+    creadoEn:      { type: Date, default: Date.now, expires: 60*60*24*180 }
+});
+const PlanEstudio = mongoose.models.PlanEstudio || mongoose.model('PlanEstudio', planEstudioSchema);
+
+// Crear plan de estudio
+app.post('/api/maestro/plan-estudio', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { grupoId, tareaIds, titulo, descripcion, preguntasPorTarea, tiempoLimiteMin } = req.body;
+        if (!tareaIds?.length || tareaIds.length < 2)
+            return res.status(400).json({ error: 'Selecciona al menos 2 tareas para el plan.' });
+
+        const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id });
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+
+        // Verificar que las tareas pertenecen al maestro
+        const tareas = await Tarea.find({ _id: { $in: tareaIds }, maestroId: req.maestro.id }).select('titulo').lean();
+        if (tareas.length !== tareaIds.length)
+            return res.status(403).json({ error: 'Algunas tareas no te pertenecen.' });
+
+        const shortId = await shortIdUnico(PlanEstudio);
+        const plan = await PlanEstudio.create({
+            shortId, maestroId: req.maestro.id, grupoId,
+            titulo:   titulo || `Plan de Estudio — ${grupo.nombre}`,
+            descripcion: descripcion || `Completa las ${tareas.length} lecturas para desbloquear el examen final.`,
+            tareaIds, preguntasPorTarea: preguntasPorTarea || 5,
+            tiempoLimiteMin: tiempoLimiteMin || 45, activo: true
+        });
+        res.json({
+            shortId: plan.shortId, titulo: plan.titulo,
+            totalTareas: tareas.length,
+            tareas: tareas.map(t => t.titulo)
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Listar planes del maestro
+app.get('/api/maestro/planes-estudio', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const planes = await PlanEstudio.find({ maestroId: req.maestro.id })
+            .sort({ creadoEn: -1 })
+            .populate('tareaIds', 'titulo shortId')
+            .lean();
+        res.json({ planes });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alumno: consultar su progreso en un plan y si puede tomar el examen
+app.get('/api/plan-estudio/:shortId/progreso', verifyAlumno, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const plan = await PlanEstudio.findOne({ shortId: req.params.shortId, activo: true })
+            .populate('tareaIds', 'titulo shortId abstract')
+            .lean();
+        if (!plan) return res.status(404).json({ error: 'Plan no encontrado.' });
+
+        const alumno = await Alumno.findById(req.alumno.id).select('nombre').lean();
+        const nombre = alumno?.nombre || '';
+
+        // Verificar qué tareas completó el alumno
+        const progresos = await Promise.all(plan.tareaIds.map(async (tarea) => {
+            const sesion = await Sesion.findOne({
+                nombre: { $regex: new RegExp(`^${nombre}$`, 'i') },
+                tareaId: tarea._id
+            }).select('pct shortId creadoEn').lean();
+            return {
+                tarea: { _id: tarea._id, titulo: tarea.titulo, shortId: tarea.shortId, abstract: tarea.abstract },
+                completada: !!sesion,
+                pct: sesion?.pct || null,
+                sesionShortId: sesion?.shortId || null
+            };
+        }));
+
+        const completadas = progresos.filter(p => p.completada).length;
+        const totalTareas = progresos.length;
+        const listoParaExamen = completadas === totalTareas;
+        const pctProgreso = Math.round((completadas / totalTareas) * 100);
+
+        // Verificar si ya tiene examen generado para este plan
+        let examenExistente = null;
+        if (listoParaExamen) {
+            examenExistente = await Examen.findOne({
+                grupoId: plan.grupoId,
+                titulo: { $regex: plan.titulo }
+            }).select('shortId titulo activo').lean();
+        }
+
+        res.json({
+            plan: { titulo: plan.titulo, descripcion: plan.descripcion },
+            progresos, completadas, totalTareas, pctProgreso,
+            listoParaExamen, examenExistente
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Generar examen automático cuando el alumno completa el plan
+app.post('/api/plan-estudio/:shortId/generar-examen', verifyAlumno, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const plan = await PlanEstudio.findOne({ shortId: req.params.shortId, activo: true })
+            .populate('tareaIds', 'titulo poolPreguntas')
+            .lean();
+        if (!plan) return res.status(404).json({ error: 'Plan no encontrado.' });
+
+        const alumno = await Alumno.findById(req.alumno.id).select('nombre').lean();
+        const nombre = alumno?.nombre || '';
+
+        // Verificar que completó todas las tareas
+        const completadas = await Promise.all(plan.tareaIds.map(t =>
+            Sesion.findOne({ nombre: { $regex: new RegExp(`^${nombre}$`,'i') }, tareaId: t._id }).lean()
+        ));
+        if (completadas.some(c => !c))
+            return res.status(403).json({ error: 'Debes completar todas las lecturas primero.' });
+
+        // Revisar si ya existe examen para este alumno en este plan
+        const examenKey = `plan_${plan.shortId}_${req.alumno.id}`;
+        const existente = await Examen.findOne({ shortId: { $regex: examenKey.substring(0,8) } }).lean();
+        if (existente) return res.json({ examenShortId: existente.shortId, yaExistia: true });
+
+        // Combinar preguntas de todas las tareas
+        let preguntas = [];
+        plan.tareaIds.forEach(t => {
+            const pool = t.poolPreguntas || [];
+            const ppt  = plan.preguntasPorTarea || 5;
+            preguntas.push(...pool.sort(() => Math.random()-0.5).slice(0, ppt));
+        });
+        preguntas = preguntas.sort(() => Math.random()-0.5);
+
+        const shortId = await shortIdUnico(Examen);
+        const examen = await Examen.create({
+            shortId,
+            maestroId: plan.maestroId,
+            grupoId:   plan.grupoId,
+            titulo:    `Examen: ${plan.titulo}`,
+            instrucciones: `Examen final del plan "${plan.titulo}". Tienes ${plan.tiempoLimiteMin} minutos.`,
+            preguntas, tiempoLimite: plan.tiempoLimiteMin, activo: true
+        });
+
+        // Desbloquear logro "primer_examen" si aplica
+        try {
+            await verificarLogros(req.alumno.id, { totalSesiones: completadas.length, primer_examen: true });
+        } catch {}
+
+        res.json({ examenShortId: examen.shortId, titulo: examen.titulo, totalPreguntas: preguntas.length });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => console.log(`🚀 Tutor IA en puerto ${PORT} — motor: ${GEMINI_KEY ? 'Gemini 2.5 Flash' : 'GROQ'}`));
