@@ -9,15 +9,67 @@ import pdfParse from 'pdf-parse';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const JWT_SECRET = process.env.JWT_SECRET || 'tutoria-secret-2026';
+
+if (!process.env.JWT_SECRET) {
+    console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
+    process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+// ── Rate-limit simple en memoria (no requiere deps adicionales)
+const rateLimitBuckets = new Map();
+function rateLimit(maxReq, windowMs) {
+    return (req, res, next) => {
+        const ip = (req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown')
+            .toString().split(',')[0].trim();
+        const key = `${ip}:${req.path}`;
+        const now = Date.now();
+        const bucket = rateLimitBuckets.get(key);
+        if (!bucket || now > bucket.reset) {
+            rateLimitBuckets.set(key, { count: 1, reset: now + windowMs });
+            return next();
+        }
+        if (bucket.count >= maxReq) {
+            const retry = Math.ceil((bucket.reset - now) / 1000);
+            return res.status(429).json({ error: `Demasiadas solicitudes. Intenta en ${retry}s.`, retryAfter: retry });
+        }
+        bucket.count++;
+        next();
+    };
+}
+// Limpieza periódica de buckets expirados
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of rateLimitBuckets) if (now > v.reset) rateLimitBuckets.delete(k);
+}, 60000).unref();
+
+// ── Sanitizado de mensajes de usuario antes de inyectar en prompts
+function sanitizeChatInput(str, maxLen = 4000) {
+    if (typeof str !== 'string') return '';
+    return str
+        .replace(/[<>{}]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, maxLen);
+}
+
+// ── Comparación timing-safe de strings (mitiga side-channel en admin auth)
+function safeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+}
 
 // ── Modelos de IA disponibles
 const GEMINI_KEY  = process.env.GEMINI_API_KEY;
@@ -61,11 +113,13 @@ const invitacionSchema = new mongoose.Schema({
 
 // Maestro
 const maestroSchema = new mongoose.Schema({
-    nombre:      { type: String, required: true },
-    email:       { type: String, required: true, unique: true, index: true },
-    passwordHash:{ type: String, required: true },
-    escuelaId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
-    creadoEn:    { type: Date, default: Date.now }
+    nombre:       { type: String, required: true },
+    email:        { type: String, required: true, unique: true, index: true },
+    passwordHash: { type: String, required: true },
+    escuelaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
+    resetToken:    { type: String, default: null },
+    resetTokenExp: { type: Date,   default: null },
+    creadoEn:     { type: Date, default: Date.now }
 });
 const Maestro = mongoose.models.Maestro || mongoose.model('Maestro', maestroSchema);
 
@@ -125,6 +179,10 @@ const tareaSchema = new mongoose.Schema({
     titulo:    String,
     abstract:  String,       // resumen breve generado por IA para la tarjeta
     resumen:   String,       // clase magistral completa
+    podcast:   String,       // guión conversacional para TTS
+    glosario:  [Object],     // [{termino, definicion}]
+    ejemplosPracticos: [Object], // [{problema, solucion_paso_a_paso}]
+    rubrica:   [Object],     // [{criterio, niveles:[...]}]
     flashcards: [Object],
     poolPreguntas: [Object], // 15-18 preguntas; alumnos ven 6 random
     contexto:  String,
@@ -201,11 +259,13 @@ const Escuela = mongoose.models.Escuela || mongoose.model('Escuela', escuelaSche
 
 // Director
 const directorSchema = new mongoose.Schema({
-    nombre:       { type: String, required: true },
-    email:        { type: String, required: true, unique: true, index: true },
-    passwordHash: { type: String, required: true },
-    escuelaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true },
-    creadoEn:     { type: Date, default: Date.now }
+    nombre:        { type: String, required: true },
+    email:         { type: String, required: true, unique: true, index: true },
+    passwordHash:  { type: String, required: true },
+    escuelaId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true },
+    resetToken:    { type: String, default: null },
+    resetTokenExp: { type: Date,   default: null },
+    creadoEn:      { type: Date, default: Date.now }
 });
 const Director = mongoose.models.Director || mongoose.model('Director', directorSchema);
 
@@ -306,8 +366,11 @@ app.get('/api/admin/escuelas', verifyAdmin, async (req, res) => {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const escuelas = await Escuela.find().sort({ nombre: 1 }).lean();
         const enriquecidas = await Promise.all(escuelas.map(async e => {
-            const totalMaestros = await Maestro.countDocuments({ escuelaId: e._id });
-            return { ...e, totalMaestros };
+            const [totalMaestros, directores] = await Promise.all([
+                Maestro.countDocuments({ escuelaId: e._id }),
+                Director.find({ escuelaId: e._id }).select('_id nombre email').lean()
+            ]);
+            return { ...e, totalMaestros, directores };
         }));
         res.json({ escuelas: enriquecidas });
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -338,7 +401,7 @@ app.patch('/api/admin/maestro/:maestroId/escuela', verifyAdmin, async (req, res)
 
 // ══ DIRECTOR — LOGIN Y PORTAL ══
 
-app.post('/api/director/login', async (req, res) => {
+app.post('/api/director/login', rateLimit(20, 60_000), async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { email, password } = req.body;
@@ -707,7 +770,7 @@ app.delete('/api/admin/alumno/:alumnoId', verifyAdmin, async (req, res) => {
 });
 
 // Login de alumno
-app.post('/api/alumno/login', async (req, res) => {
+app.post('/api/alumno/login', rateLimit(20, 60_000), async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { email, password } = req.body;
@@ -725,27 +788,64 @@ app.post('/api/alumno/login', async (req, res) => {
 
 // ── Groq
 // ══ LLAMADA IA UNIVERSAL — Gemini 2.5 Flash (primero) + GROQ fallback ══
-// Límites de tokens por tipo de llamada
+// Límites de tokens por tipo de llamada — incrementados para lecciones más ricas
 const TOKEN_LIMITS = {
-    estudiar: 8192,  // clase completa
-    tarea:    8192,  // pool de 15 preguntas
-    chat:     2048,  // respuestas de chat
-    recursos: 1024,  // búsqueda de recursos
-    examen:   4096,  // generación de examen
-    vision:   4096,  // extracción de imagen
+    estudiar: 16384, // clase magistral completa (era 8192, se truncaba)
+    tarea:    16384, // pool de 15 preguntas + resumen largo + rubrica
+    chat:     4096,  // respuestas de chat (era 2048)
+    recursos: 2048,  // búsqueda de recursos
+    examen:   6144,  // generación de examen
+    vision:   6144,  // extracción de imagen estructurada
 };
 
+// ── Caché en memoria (TTL) para contenido generado por IA
+//    Clave: md5(tipo + JSON.stringify(messages)) → evita regenerar la misma URL/texto
+const iaCache = new Map();
+const IA_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora
+function iaCacheKey(tipo, messages) {
+    const h = crypto.createHash('md5').update(tipo + '::' + JSON.stringify(messages)).digest('hex');
+    return h;
+}
+function iaCacheGet(key) {
+    const hit = iaCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.exp) { iaCache.delete(key); return null; }
+    return hit.value;
+}
+function iaCacheSet(key, value) {
+    iaCache.set(key, { value, exp: Date.now() + IA_CACHE_TTL_MS });
+    if (iaCache.size > 500) { // cap en 500 entradas
+        const oldest = iaCache.keys().next().value;
+        iaCache.delete(oldest);
+    }
+}
+
 async function iaCall(messages, jsonMode = false, meta = {}) {
+    const useCache = meta.tipo !== 'chat' && meta.cache !== false;
+    const key = useCache ? iaCacheKey(meta.tipo || 'default', messages) : null;
+    if (useCache) {
+        const cached = iaCacheGet(key);
+        if (cached) { console.log(`⚡ Cache hit [${meta.tipo}]`); return cached; }
+    }
+
+    let result;
     if (GEMINI_KEY) {
         try {
-            return await geminiCall(messages, jsonMode, meta);
+            result = await geminiCall(messages, jsonMode, meta);
+            if (useCache) iaCacheSet(key, result);
+            return result;
         } catch(e) {
-            console.warn('Gemini falló, usando GROQ fallback:', e.message);
+            console.warn('Gemini falló tras reintentos, usando GROQ fallback:', e.message);
         }
     }
     if (!GROQ_KEY) throw new Error('No hay motor de IA configurado. Agrega GEMINI_API_KEY o GROQ_API_KEY en Render.');
-    return await groqCall(messages, jsonMode, meta);
+    result = await groqCall(messages, jsonMode, meta);
+    if (useCache) iaCacheSet(key, result);
+    return result;
 }
+
+// ── Delay helper para backoff exponencial
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function geminiCall(messages, jsonMode = false, meta = {}) {
     const systemMsg = messages.find(m => m.role === 'system');
@@ -766,7 +866,7 @@ async function geminiCall(messages, jsonMode = false, meta = {}) {
         contents,
         systemInstruction: systemMsg ? { parts: [{ text: systemMsg.content }] } : undefined,
         generationConfig: {
-            temperature: meta.tipo === 'chat' ? 0.8 : 0.7,
+            temperature: meta.temperature ?? (meta.tipo === 'chat' ? 0.8 : meta.tipo === 'vision' ? 0.05 : 0.7),
             maxOutputTokens: maxOut,
             ...(jsonMode ? { responseMimeType: 'application/json' } : {})
         },
@@ -777,10 +877,27 @@ async function geminiCall(messages, jsonMode = false, meta = {}) {
     };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
-    const response = await axios.post(url, body, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 90000
-    });
+
+    // ── Reintentos exponenciales solo si el error es 429/5xx transitorio
+    const maxAttempts = 3;
+    const backoffs = [200, 400, 800];
+    let response, lastErr;
+    for (let i = 0; i < maxAttempts; i++) {
+        try {
+            response = await axios.post(url, body, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 120000
+            });
+            break;
+        } catch(e) {
+            lastErr = e;
+            const status = e.response?.status;
+            const retriable = !status || status === 429 || (status >= 500 && status < 600) || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT';
+            if (!retriable || i === maxAttempts - 1) throw e;
+            console.warn(`Gemini retry ${i+1}/${maxAttempts} tras ${status || e.code}`);
+            await sleep(backoffs[i]);
+        }
+    }
 
     const candidate = response.data.candidates?.[0];
     if (!candidate) throw new Error('Gemini no retornó candidatos');
@@ -990,26 +1107,42 @@ async function extraerTextoWeb(url) {
     throw new Error(`No se pudo leer: ${url}\n\n💡 Opciones:\n• Pega el texto directamente\n• Usa Wikipedia, Khan Academy o YouTube del mismo tema\n• Si es PDF, súbelo en "Foto/PDF"`);
 }
 
-// ── Búsqueda de recursos educativos con Gemini Grounding
+// ── Verificación paralela de URLs por HEAD (filtra las que devuelven ≥400 o timeout)
+async function verificarUrlsParalelo(urls, timeoutMs = 5000) {
+    const pruebas = urls.map(u => axios.head(u, {
+        timeout: timeoutMs,
+        maxRedirects: 3,
+        validateStatus: s => s < 400
+    }).then(() => ({ url: u, ok: true }))
+      .catch(() => ({ url: u, ok: false })));
+    const resultados = await Promise.all(pruebas);
+    return new Set(resultados.filter(r => r.ok).map(r => r.url));
+}
+
+// ── Búsqueda de recursos educativos con Gemini Grounding + verificación de URLs
 async function buscarRecursosEducativosIA(tema) {
     if (!GEMINI_KEY) return null;
     try {
         const body = {
             contents: [{ role: "user", parts: [{ text:
-`Busca recursos educativos REALES y actuales en español sobre: "${tema}"
+`Busca recursos educativos REALES y actuales en español mexicano sobre: "${tema}"
 
-Encuentra específicamente:
-1. Videos de YouTube de canales educativos confiables (DW, BBC, TED-Ed, Khan Academy, UNAM, Kurzgesagt, Crash Course, etc.)
-2. Artículos de fuentes serias (Wikipedia, Khan Academy, National Geographic, Britannica, gov.mx, UNAM)
-3. PDFs o documentos académicos gratuitos si existen
+FUENTES OBLIGATORIAS (usa google_search):
+1. Videos de YouTube de canales educativos confiables (Khan Academy, UNAM, IPN, TED-Ed en español, Kurzgesagt en español, Crash Course en español, Date un Vlog, Derivando, QuantumFracture, Math2Me, DW en español, BBC Mundo).
+2. Artículos de fuentes serias (Wikipedia en español, Khan Academy, National Geographic, Britannica, gob.mx, UNAM, CONACYT, IPN).
+3. PDFs o documentos académicos gratuitos si existen.
 
-Responde SOLO con este JSON exacto (sin texto extra):
-{"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=...","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}
+REGLAS ABSOLUTAS:
+• PROHIBIDO inventar URLs. Solo devuelve URLs que vengan DIRECTAMENTE de resultados de google_search — si no tienes resultado seguro para una categoría, devuelve array vacío [].
+• Los IDs de YouTube deben ser exactamente los de los resultados de búsqueda — nunca inventes un ID de 11 caracteres.
+• No incluyas URLs con parámetros de tracking (?utm_, ?si=, ?feature=).
+• Si dudas de una URL, omítela. Es mejor un array pequeño y correcto que uno grande con enlaces rotos.
 
-Solo incluye URLs que realmente existan y sean accesibles. Verifica que los IDs de YouTube sean válidos.`
+Responde SOLO con este JSON exacto:
+{"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=XXXXXXXXXXX","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}`
             }] }],
             tools: [{ google_search: {} }],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: "application/json" }
+            generationConfig: { temperature: 0.15, maxOutputTokens: 2048, responseMimeType: "application/json" }
         };
         const resp = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
@@ -1017,7 +1150,20 @@ Solo incluye URLs que realmente existan y sean accesibles. Verifica que los IDs 
         );
         const texto = resp.data.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("").trim();
         if (!texto) return null;
-        return JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim());
+        const data = JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim());
+
+        // Verificación paralela HEAD: filtra URLs rotas
+        const todasUrls = [
+            ...(data.videos || []).map(v => v.url).filter(Boolean),
+            ...(data.articulos || []).map(a => a.url).filter(Boolean)
+        ];
+        if (todasUrls.length) {
+            const validas = await verificarUrlsParalelo(todasUrls, 5000);
+            data.videos    = (data.videos || []).filter(v => validas.has(v.url));
+            data.articulos = (data.articulos || []).filter(a => validas.has(a.url));
+            console.log(`✅ Recursos verificados: ${data.videos.length} videos + ${data.articulos.length} artículos (de ${todasUrls.length} propuestos)`);
+        }
+        return data;
     } catch(e) { console.warn("Búsqueda recursos IA falló:", e.message); return null; }
 }
 
@@ -1036,28 +1182,38 @@ async function generarDesdeTemaBuscado(temaOUrl, meta = {}) {
 
     const body = {
         contents: [{ role: "user", parts: [{ text:
-`Eres un experto educador de preparatoria mexicano. Busca información actualizada y confiable sobre: "${tema}"
+`Eres un profesor de preparatoria mexicano experto. Usa Google Search para encontrar información REAL, actualizada y confiable sobre: "${tema}"
 
-Usa búsqueda para encontrar:
-- Definiciones precisas y actualizadas
-- Conceptos clave del tema
-- Ejemplos concretos y reales
-- Datos históricos o científicos relevantes
-- Al menos 3-4 subtemas importantes
+Debes obtener de las búsquedas:
+- Definiciones precisas y actuales (verificadas contra 2+ fuentes)
+- Conceptos clave del tema con ejemplos reales
+- Datos históricos/científicos/sociales relevantes con cifras verificables
+- Al menos 4 sub-temas importantes
+- 2-4 fuentes confiables reales (Wikipedia, Khan Academy, UNAM, gob.mx, National Geographic, etc.)
 
-Con esa información, crea una clase magistral COMPLETA para preparatoria (14-18 años).
+Con esa información, crea una CLASE MAGISTRAL EXPANSIVA para preparatoria mexicana (14-18 años).
 
-Responde SOLO con este JSON:
-{"titulo":"Título atractivo","resumen":"Clase magistral con <b>conceptos</b> en negritas y <br><br> entre párrafos... (mínimo 6 párrafos ricos)","podcast":"Guión conversacional 300-400 palabras...","quiz":[{"p":"Pregunta 1","o":["A","B","C","D"],"r":0},{"p":"P2","o":["A","B","C","D"],"r":1},{"p":"P3","o":["A","B","C","D"],"r":2},{"p":"P4","o":["A","B","C","D"],"r":3},{"p":"P5","o":["A","B","C","D"],"r":0},{"p":"P6","o":["A","B","C","D"],"r":2}],"flashcards":[{"anverso":"Concepto","reverso":"Def+ejemplo+importancia"},{"anverso":"C2","reverso":"..."},{"anverso":"C3","reverso":"..."},{"anverso":"C4","reverso":"..."},{"anverso":"C5","reverso":"..."},{"anverso":"C6","reverso":"..."},{"anverso":"C7","reverso":"..."},{"anverso":"C8","reverso":"..."}],"fuentes":["fuente1","fuente2","fuente3"]}`
+Estructura obligatoria del "resumen" (10 párrafos, 3500-4500 caracteres):
+  1) Hook cotidiano mexicano. 2) Definición + 2 equivalencias. 3-6) Cuatro sub-temas con ejemplo mexicano. 7) Errores comunes. 8) Aplicaciones diarias. 9) Conexión con otras materias. 10) Cierre con pregunta abierta.
+Usa <b>negritas</b> para conceptos y <br><br> entre párrafos. Prosa fluida, sin viñetas.
+
+REGLAS:
+- NO inventes fuentes ni URLs. Si no estás 100% seguro, omite la cifra.
+- El "podcast" debe durar 500-700 palabras, tono locutor educativo mexicano.
+- Incluye "glosario" (6-10 términos) y "ejemplosPracticos" (3 casos con solución).
+- Las 6 preguntas del quiz deben cubrir niveles Bloom [recordar, comprender, aplicar, analizar, evaluar, crear].
+
+Responde SOLO con este JSON (sin markdown, sin texto extra):
+{"titulo":"...","abstract":"Gancho 2-3 oraciones","resumen":"10 párrafos con <b>...</b><br><br>...","podcast":"Guión 500-700 palabras","glosario":[{"termino":"...","definicion":"..."}],"ejemplosPracticos":[{"problema":"...","solucion_paso_a_paso":"..."}],"quiz":[{"p":"P1","o":["A","B","C","D"],"r":0,"bloom":"recordar"},{"p":"P2","o":["A","B","C","D"],"r":1,"bloom":"comprender"},{"p":"P3","o":["A","B","C","D"],"r":2,"bloom":"aplicar"},{"p":"P4","o":["A","B","C","D"],"r":3,"bloom":"analizar"},{"p":"P5","o":["A","B","C","D"],"r":0,"bloom":"evaluar"},{"p":"P6","o":["A","B","C","D"],"r":2,"bloom":"crear"}],"flashcards":[{"anverso":"T1","reverso":"Def. Ejemplo: ... Importancia: ..."},{"anverso":"T2","reverso":"..."},{"anverso":"T3","reverso":"..."},{"anverso":"T4","reverso":"..."},{"anverso":"T5","reverso":"..."},{"anverso":"T6","reverso":"..."},{"anverso":"T7","reverso":"..."},{"anverso":"T8","reverso":"..."}],"fuentes":["Nombre fuente 1 (tipo)","Nombre fuente 2 (tipo)"]}`
         }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8192, responseMimeType: "application/json" },
+        generationConfig: { temperature: 0.7, maxOutputTokens: 16384, responseMimeType: "application/json" },
         safetySettings: [{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" }]
     };
 
     const resp = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-        body, { headers: { "Content-Type": "application/json" }, timeout: 90000 }
+        body, { headers: { "Content-Type": "application/json" }, timeout: 120000 }
     );
     const usage = resp.data.usageMetadata || {};
     if (mongoose.connection.readyState) {
@@ -1105,44 +1261,73 @@ async function procesarConIA(sourceText, meta = {}) {
     const messages = [
         {
             role: 'system',
-            content: `Eres un profesor de preparatoria mexicano experto y apasionado. Tu misión es transformar cualquier contenido en una experiencia de aprendizaje memorable. Respondes ÚNICAMENTE con JSON válido y bien formado, sin texto adicional ni bloques de código.`
+            content: `Eres un profesor de preparatoria mexicano experto, apasionado y riguroso. Dominas pedagogía basada en la taxonomía de Bloom, diseñas clases memorables y usas contexto mexicano real (UNAM, IPN, vida cotidiana, cultura, referentes locales). Respondes ÚNICAMENTE con JSON válido y bien formado — sin texto adicional, sin bloques de código, sin markdown fuera de las <b> permitidas en el campo "resumen".`
         },
         {
             role: 'user',
             content: `Fuente: ${contextoTipo}
 
-Transforma el siguiente contenido en una clase magistral completa y atractiva para estudiantes de preparatoria (14-18 años) en México.
+Transforma el contenido en una CLASE MAGISTRAL EXPANSIVA para estudiantes mexicanos de preparatoria (14-18 años). La clase debe sentirse como la mejor que han tenido: rica, clara, con ejemplos reales.
 
-INSTRUCCIONES DETALLADAS:
-1. RESUMEN (clase magistral): Mínimo 6 párrafos ricos y detallados. Escribe como un maestro apasionado que explica con ejemplos concretos, analogías y contexto cultural mexicano cuando aplique. Usa <b>negritas</b> para conceptos clave y <br><br> entre párrafos. NUNCA uses viñetas ni listas — siempre prosa fluida.
-2. PODCAST: Texto pensado para leerlo en voz alta, natural y conversacional, como si hablaras directamente al estudiante. Usa "imagina que..." y "piénsalo así...". Entre 300-400 palabras.
-3. QUIZ: 6 preguntas que van de fácil a difícil. Las preguntas deben evaluar comprensión real, no memorización. Las 4 opciones deben ser plausibles (no tramposamente obvias). El índice de respuesta correcta (r) empieza en 0.
-4. FLASHCARDS: 8 tarjetas con los conceptos más importantes. El reverso debe incluir: definición clara + ejemplo práctico + por qué importa.
+ESTRUCTURA OBLIGATORIA DEL "resumen" (mínimo 10 párrafos, 3500-4500 caracteres totales):
+  Párrafo 1 — HOOK: abre con una pregunta provocadora o una escena cotidiana mexicana.
+  Párrafo 2 — DEFINICIÓN formal del concepto principal + 2 sinónimos o formulaciones equivalentes.
+  Párrafos 3-6 — CUATRO SUB-TEMAS desarrollados, cada uno con un ejemplo concreto mexicano (ciudades, alimentos, historia, ciencia local).
+  Párrafo 7 — ERRORES COMUNES que cometen los estudiantes y cómo evitarlos.
+  Párrafo 8 — APLICACIONES en la vida diaria (redes sociales, trabajo, familia, entorno).
+  Párrafo 9 — CONEXIÓN con otras materias (matemáticas↔física↔biología, literatura↔historia, etc.).
+  Párrafo 10 — CIERRE motivador con pregunta abierta para reflexión.
+  Usa <b>negritas</b> para conceptos clave y <br><br> entre párrafos. Prosa fluida, sin viñetas.
 
-FORMATO JSON (SOLO JSON, sin markdown ni texto extra):
+OTROS CAMPOS:
+• "podcast": guión conversacional de 500-700 palabras, en tono de locutor de radio educativa mexicana (usa "imagina que...", "piénsalo así...", "¿te ha pasado que...?"). Natural para escuchar en TTS.
+• "abstract": 2-3 oraciones gancho: "En esta clase aprenderás X y por qué importa en tu vida."
+• "glosario": 6-10 términos adicionales con definición breve (1 línea cada uno).
+• "ejemplosPracticos": 3 objetos {problema, solucion_paso_a_paso}. La solución debe explicarse en 3-5 pasos numerados.
+• "quiz": 6 preguntas distribuidas por nivel Bloom en este orden: [recordar, comprender, aplicar, analizar, evaluar, crear]. Añade un campo "bloom" con el nivel. Los 4 distractores deben ser errores plausibles reales (NO absurdos). Índice "r" basado en 0.
+• "flashcards": 8 tarjetas. Reverso con: definición precisa + ejemplo concreto + por qué importa.
+• "fuentes": 2-4 referencias cortas donde el estudiante puede profundizar (nombre + tipo, sin URLs inventadas).
+
+FORMATO JSON EXACTO (SOLO JSON):
 {
-  "titulo": "Título atractivo y específico del tema",
-  "resumen": "Clase magistral rica con <b>conceptos</b> en negritas y <br><br> entre párrafos...",
-  "podcast": "Texto conversacional para escuchar...",
+  "titulo": "Título atractivo y específico",
+  "abstract": "2-3 oraciones gancho.",
+  "resumen": "Párrafo 1 <b>concepto</b>...<br><br>Párrafo 2...<br><br>... (10 párrafos, 3500-4500 chars)",
+  "podcast": "Guión conversacional 500-700 palabras.",
+  "glosario": [
+    {"termino": "T1", "definicion": "..."},
+    {"termino": "T2", "definicion": "..."}
+  ],
+  "ejemplosPracticos": [
+    {"problema": "...", "solucion_paso_a_paso": "1) ... 2) ... 3) ..."},
+    {"problema": "...", "solucion_paso_a_paso": "..."},
+    {"problema": "...", "solucion_paso_a_paso": "..."}
+  ],
   "quiz": [
-    {"p": "Pregunta clara y específica", "o": ["Opción completa A", "Opción completa B", "Opción completa C", "Opción completa D"], "r": 0},
-    {"p": "Pregunta más elaborada", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2},
-    {"p": "Pregunta de aplicación", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 1},
-    {"p": "Pregunta de análisis", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 3},
-    {"p": "Pregunta que conecta conceptos", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 0},
-    {"p": "Pregunta de nivel avanzado", "o": ["Opción A", "Opción B", "Opción C", "Opción D"], "r": 2}
+    {"p": "Pregunta nivel recordar", "o": ["A","B","C","D"], "r": 0, "bloom": "recordar"},
+    {"p": "Pregunta nivel comprender", "o": ["A","B","C","D"], "r": 1, "bloom": "comprender"},
+    {"p": "Pregunta nivel aplicar", "o": ["A","B","C","D"], "r": 2, "bloom": "aplicar"},
+    {"p": "Pregunta nivel analizar", "o": ["A","B","C","D"], "r": 3, "bloom": "analizar"},
+    {"p": "Pregunta nivel evaluar", "o": ["A","B","C","D"], "r": 0, "bloom": "evaluar"},
+    {"p": "Pregunta nivel crear", "o": ["A","B","C","D"], "r": 2, "bloom": "crear"}
   ],
   "flashcards": [
-    {"anverso": "Término o concepto", "reverso": "Definición precisa. Ejemplo: [ejemplo concreto]. Importancia: [por qué esto importa]."},
-    {"anverso": "Término 2", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 3", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 4", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 5", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 6", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 7", "reverso": "Definición + ejemplo + importancia."},
-    {"anverso": "Término 8", "reverso": "Definición + ejemplo + importancia."}
-  ]${esVideo ? ',\n  "videoId": "' + videoId + '"' : ''}
+    {"anverso": "Término 1", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
+    {"anverso": "Término 2", "reverso": "..."},
+    {"anverso": "Término 3", "reverso": "..."},
+    {"anverso": "Término 4", "reverso": "..."},
+    {"anverso": "Término 5", "reverso": "..."},
+    {"anverso": "Término 6", "reverso": "..."},
+    {"anverso": "Término 7", "reverso": "..."},
+    {"anverso": "Término 8", "reverso": "..."}
+  ],
+  "fuentes": ["Fuente 1 (tipo)", "Fuente 2 (tipo)"]${esVideo ? ',\n  "videoId": "' + videoId + '"' : ''}
 }
+
+REGLAS CRÍTICAS:
+- Si el contenido es corto, EXPANDE con conocimiento confiable del tema — nunca dejes campos vacíos o con placeholders.
+- NO inventes datos, fechas ni estadísticas específicas si no estás seguro; usa frases como "aproximadamente" o omite cifras dudosas.
+- Mantén español mexicano natural (sin españolismos como "vale", "guay", "ordenador").
 
 CONTENIDO FUENTE:
 ${texto.substring(0, 30000)}`
@@ -1168,59 +1353,91 @@ ${texto.substring(0, 30000)}`
     return data;
 }
 
-// ── Procesador IA para Tarea — genera pool de 15 preguntas + abstract
+// ── Procesador IA para Tarea — genera pool de 15 preguntas + abstract + rubrica
 async function procesarConIAPool(sourceText, meta = {}) {
     if (!sourceText || sourceText.length < 50)
         throw new Error("No se encontró suficiente texto para analizar.");
 
+    const materia = meta.materia ? String(meta.materia) : '';
+    const semestre = meta.semestre ? String(meta.semestre) : '';
+    const contextoMateria = (materia || semestre)
+        ? `Especialización: ${materia || 'general'}${semestre ? ' — ' + semestre : ''} de preparatoria mexicana. Adapta vocabulario, profundidad y ejemplos a ese nivel.`
+        : '';
+
     const messages = [
         {
             role: 'system',
-            content: 'Eres un profesor de preparatoria mexicano experto. Creas material de estudio de altísima calidad. Respondes ÚNICAMENTE con JSON válido y bien formado, sin texto adicional ni bloques de código markdown.'
+            content: `Eres un profesor de preparatoria mexicano experto. Diseñas material de evaluación de altísima calidad con distractores que reflejan los errores reales que cometen los estudiantes. ${contextoMateria} Respondes ÚNICAMENTE con JSON válido y bien formado — sin texto adicional, sin markdown fuera de <b> en "resumen".`
         },
         {
             role: 'user',
-            content: `Crea material completo de estudio para preparatoria basándote en el siguiente contenido.
+            content: `Crea material completo de estudio + pool de preguntas para tarea asignada por el maestro.
 
-INSTRUCCIONES:
-1. RESUMEN: Mínimo 6 párrafos como clase magistral. Maestro apasionado, ejemplos concretos, contexto real. Usa <b>negritas</b> para conceptos clave y <br><br> entre párrafos. Sin viñetas ni listas.
-2. ABSTRACT: 2-3 oraciones que enganchen al alumno: "En esta clase aprenderás... y por qué importa en tu vida."
-3. PODCAST: Guión conversacional para escuchar (300-400 palabras). Habla directo al alumno, usa analogías cotidianas.
-4. POOL DE PREGUNTAS (15): Distribuye la dificultad — 5 básicas (nivel recordar/comprender), 5 intermedias (aplicar/analizar), 5 avanzadas (evaluar/crear). Las 4 opciones deben ser específicas y plausibles. NUNCA uses letras como opciones.
-5. FLASHCARDS (8): Término → Definición precisa + ejemplo real + por qué importa conocerlo.
+ESTRUCTURA OBLIGATORIA DEL "resumen" (10 párrafos, 3500-4500 caracteres):
+  1) Hook con escena cotidiana mexicana. 2) Definición formal + 2 equivalencias. 3-6) Cuatro sub-temas con ejemplo mexicano concreto. 7) Errores comunes de estudiantes. 8) Aplicaciones diarias. 9) Conexión con otras materias. 10) Cierre con pregunta abierta.
+  Usa <b>negritas</b> y <br><br>. Prosa fluida, sin viñetas.
 
-FORMATO JSON REQUERIDO:
+OTROS CAMPOS:
+• "abstract": 2-3 oraciones gancho ("En esta tarea aprenderás X y por qué importa").
+• "podcast": guión conversacional 500-700 palabras, tono de locutor educativo mexicano.
+• "glosario": 6-10 términos con definición breve.
+• "ejemplosPracticos": 3 objetos {problema, solucion_paso_a_paso (3-5 pasos)}.
+• "poolPreguntas" (EXACTAMENTE 15): distribución estricta:
+    - Preguntas 1-5: nivel BÁSICO (Bloom: recordar, comprender)
+    - Preguntas 6-10: nivel INTERMEDIO (Bloom: aplicar, analizar)
+    - Preguntas 11-15: nivel AVANZADO (Bloom: evaluar, crear)
+    REGLAS DURAS:
+    ▸ Cada una de las 15 preguntas cubre un CONCEPTO DISTINTO. Prohibido preguntar dos veces lo mismo.
+    ▸ Los 3 distractores son errores comunes reales (confusiones típicas, inversiones de relación causa-efecto, definiciones incompletas) — NUNCA absurdos ni obviamente falsos.
+    ▸ Las 4 opciones tienen longitud similar (±20%). No hagas la respuesta correcta más larga.
+    ▸ Prohibido repetir la misma estructura gramatical en 2 preguntas consecutivas.
+    ▸ Nunca uses "ninguna de las anteriores" ni "todas las anteriores".
+    ▸ Añade un campo "bloom" con el nivel específico.
+• "flashcards" (8): anverso=término, reverso=definición precisa + ejemplo concreto + por qué importa.
+• "rubrica" (3 criterios): para evaluación escrita. Cada criterio con 4 niveles {nivel, descripcion}.
+
+FORMATO JSON EXACTO:
 {
   "titulo": "Título atractivo y específico",
-  "abstract": "2-3 oraciones que enganchen: qué aprenderás y por qué importa.",
-  "resumen": "Clase magistral con <b>conceptos</b> en negritas y <br><br> entre párrafos...",
-  "podcast": "Guión conversacional para escuchar...",
+  "abstract": "Gancho 2-3 oraciones.",
+  "resumen": "10 párrafos con <b>negritas</b> y <br><br>...",
+  "podcast": "Guión 500-700 palabras.",
+  "glosario": [{"termino":"T1","definicion":"..."}, ...],
+  "ejemplosPracticos": [{"problema":"...","solucion_paso_a_paso":"1) ... 2) ..."}, ...],
   "poolPreguntas": [
-    {"p": "¿Pregunta básica sobre el tema?", "o": ["Respuesta correcta", "Distractor plausible 1", "Distractor plausible 2", "Distractor plausible 3"], "r": 0},
-    {"p": "¿Pregunta de comprensión?", "o": ["Distractor", "Respuesta correcta", "Distractor", "Distractor"], "r": 1},
-    {"p": "¿Pregunta de aplicación?", "o": ["Distractor", "Distractor", "Respuesta correcta", "Distractor"], "r": 2},
-    {"p": "¿Pregunta de análisis?", "o": ["Distractor", "Distractor", "Distractor", "Respuesta correcta"], "r": 3},
-    {"p": "¿Quinta pregunta?", "o": ["Respuesta correcta", "Distractor", "Distractor", "Distractor"], "r": 0},
-    {"p": "¿Sexta pregunta?", "o": ["Distractor", "Respuesta correcta", "Distractor", "Distractor"], "r": 1},
-    {"p": "¿Séptima pregunta?", "o": ["Distractor", "Distractor", "Respuesta correcta", "Distractor"], "r": 2},
-    {"p": "¿Octava pregunta?", "o": ["Distractor", "Distractor", "Distractor", "Respuesta correcta"], "r": 3},
-    {"p": "¿Novena pregunta?", "o": ["Respuesta correcta", "Distractor", "Distractor", "Distractor"], "r": 0},
-    {"p": "¿Décima pregunta?", "o": ["Distractor", "Respuesta correcta", "Distractor", "Distractor"], "r": 1},
-    {"p": "¿Pregunta avanzada 1?", "o": ["Distractor", "Distractor", "Respuesta correcta", "Distractor"], "r": 2},
-    {"p": "¿Pregunta avanzada 2?", "o": ["Distractor", "Distractor", "Distractor", "Respuesta correcta"], "r": 3},
-    {"p": "¿Pregunta avanzada 3?", "o": ["Respuesta correcta", "Distractor", "Distractor", "Distractor"], "r": 0},
-    {"p": "¿Pregunta avanzada 4?", "o": ["Distractor", "Respuesta correcta", "Distractor", "Distractor"], "r": 1},
-    {"p": "¿Pregunta más difícil?", "o": ["Distractor", "Distractor", "Respuesta correcta", "Distractor"], "r": 2}
+    {"p":"P1 básica","o":["A","B","C","D"],"r":0,"bloom":"recordar"},
+    {"p":"P2 básica","o":["A","B","C","D"],"r":1,"bloom":"recordar"},
+    {"p":"P3 básica","o":["A","B","C","D"],"r":2,"bloom":"comprender"},
+    {"p":"P4 básica","o":["A","B","C","D"],"r":3,"bloom":"comprender"},
+    {"p":"P5 básica","o":["A","B","C","D"],"r":0,"bloom":"comprender"},
+    {"p":"P6 intermedia","o":["A","B","C","D"],"r":1,"bloom":"aplicar"},
+    {"p":"P7 intermedia","o":["A","B","C","D"],"r":2,"bloom":"aplicar"},
+    {"p":"P8 intermedia","o":["A","B","C","D"],"r":3,"bloom":"analizar"},
+    {"p":"P9 intermedia","o":["A","B","C","D"],"r":0,"bloom":"analizar"},
+    {"p":"P10 intermedia","o":["A","B","C","D"],"r":1,"bloom":"analizar"},
+    {"p":"P11 avanzada","o":["A","B","C","D"],"r":2,"bloom":"evaluar"},
+    {"p":"P12 avanzada","o":["A","B","C","D"],"r":3,"bloom":"evaluar"},
+    {"p":"P13 avanzada","o":["A","B","C","D"],"r":0,"bloom":"crear"},
+    {"p":"P14 avanzada","o":["A","B","C","D"],"r":1,"bloom":"crear"},
+    {"p":"P15 avanzada","o":["A","B","C","D"],"r":2,"bloom":"crear"}
   ],
   "flashcards": [
-    {"anverso": "Término 1", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 2", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 3", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 4", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 5", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 6", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 7", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
-    {"anverso": "Término 8", "reverso": "Definición. Ejemplo: ... Importancia: ..."}
+    {"anverso":"T1","reverso":"Definición. Ejemplo: ... Importancia: ..."},
+    {"anverso":"T2","reverso":"..."}, {"anverso":"T3","reverso":"..."},
+    {"anverso":"T4","reverso":"..."}, {"anverso":"T5","reverso":"..."},
+    {"anverso":"T6","reverso":"..."}, {"anverso":"T7","reverso":"..."},
+    {"anverso":"T8","reverso":"..."}
+  ],
+  "rubrica": [
+    {"criterio":"Comprensión del tema","niveles":[
+      {"nivel":"Excelente","descripcion":"..."},{"nivel":"Bueno","descripcion":"..."},
+      {"nivel":"Suficiente","descripcion":"..."},{"nivel":"Insuficiente","descripcion":"..."}]},
+    {"criterio":"Uso de ejemplos y evidencia","niveles":[
+      {"nivel":"Excelente","descripcion":"..."},{"nivel":"Bueno","descripcion":"..."},
+      {"nivel":"Suficiente","descripcion":"..."},{"nivel":"Insuficiente","descripcion":"..."}]},
+    {"criterio":"Claridad y redacción","niveles":[
+      {"nivel":"Excelente","descripcion":"..."},{"nivel":"Bueno","descripcion":"..."},
+      {"nivel":"Suficiente","descripcion":"..."},{"nivel":"Insuficiente","descripcion":"..."}]}
   ]
 }
 
@@ -1257,7 +1474,7 @@ app.get('/api/grupos', async (req, res) => {
 });
 
 // Estudiar
-app.post('/api/estudiar', verifyAlumno, checkLimiteDiario, async (req, res) => {
+app.post('/api/estudiar', rateLimit(15, 60_000), verifyAlumno, checkLimiteDiario, async (req, res) => {
     try {
         const { input } = req.body;
         if (!input) return res.status(400).json({ error: "Falta contenido." });
@@ -1309,9 +1526,10 @@ app.post('/api/estudiar-archivo', verifyAlumno, checkLimiteDiario, upload.array(
 });
 
 // ══ CHAT ALUMNO — contexto completo de la clase ══
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', rateLimit(40, 60_000), async (req, res) => {
     try {
-        const { context, question, sesionData, historial } = req.body;
+        const { context, question: rawQuestion, sesionData, historial } = req.body;
+        const question = sanitizeChatInput(rawQuestion);
         if (!question) return res.status(400).json({ error: 'Falta la pregunta.' });
 
         let contextoCompleto = '';
@@ -1352,9 +1570,10 @@ ${contextoCompleto ? `\n=== MATERIAL DE LA CLASE ===\n${contextoCompleto}\n=== F
 });
 
 // ══ CHAT MAESTRO — SOLO datos internos del grupo ══
-app.post('/api/maestro/chat', verifyToken, async (req, res) => {
+app.post('/api/maestro/chat', rateLimit(40, 60_000), verifyToken, async (req, res) => {
     try {
-        const { grupoId, pregunta, historial } = req.body;
+        const { grupoId, pregunta: rawPreg, historial } = req.body;
+        const pregunta = sanitizeChatInput(rawPreg);
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
 
         // Construir contexto completo y real del grupo
@@ -1436,12 +1655,11 @@ ${contextoGrupo}` },
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ══ CHAT DIRECTOR — SOLO datos reales de la institución ══
-
-// ══ CHAT DIRECTOR — con contexto de toda la institución ══
-app.post('/api/director/chat', verifyDirector, async (req, res) => {
+// ══ CHAT DIRECTOR — con contexto real de la institución ══
+app.post('/api/director/chat', rateLimit(40, 60_000), verifyDirector, async (req, res) => {
     try {
-        const { pregunta, historial } = req.body;
+        const { pregunta: rawPreg, historial } = req.body;
+        const pregunta = sanitizeChatInput(rawPreg);
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
 
         // Datos REALES de la institución del director (no de toda la BD)
@@ -1516,79 +1734,6 @@ ${ctx}` },
         const answer = await iaCall(messages, false, { tipo: 'chat' });
         res.json({ answer });
     } catch(e) { res.status(500).json({ error: e.message }); }
-});
-            const hace30 = new Date(Date.now() - 30*24*60*60*1000);
-            const hace7  = new Date(Date.now() - 7*24*60*60*1000);
-            const hoy    = new Date(new Date().setHours(0,0,0,0));
-
-            const [totalMaestros, totalAlumnos, sesiones30d, sesiones7d, sesionesHoy] = await Promise.all([
-                Maestro.countDocuments(),
-                Alumno.countDocuments({ activo: true }),
-                Sesion.countDocuments({ creadoEn: { $gte: hace30 } }),
-                Sesion.countDocuments({ creadoEn: { $gte: hace7 } }),
-                Sesion.countDocuments({ creadoEn: { $gte: hoy } })
-            ]);
-
-            // Promedio general
-            const sesionesMuestra = await Sesion.find({ creadoEn: { $gte: hace30 } }).select('pct nombre grupoId').lean().limit(500);
-            const promedio = sesionesMuestra.length ? Math.round(sesionesMuestra.reduce((a,s)=>a+(s.pct||0),0)/sesionesMuestra.length) : 0;
-
-            // Alumnos en riesgo (menos de 60% en últimas 3 sesiones)
-            const alumnosRiesgo = [];
-            const alumnosMap = {};
-            sesionesMuestra.forEach(s => {
-                if (!alumnosMap[s.nombre]) alumnosMap[s.nombre] = [];
-                alumnosMap[s.nombre].push(s.pct || 0);
-            });
-            Object.entries(alumnosMap).forEach(([nombre, pcts]) => {
-                const ultimas3 = pcts.slice(-3);
-                const prom3 = ultimas3.reduce((a,b)=>a+b,0)/ultimas3.length;
-                if (prom3 < 60 && ultimas3.length >= 2) alumnosRiesgo.push({ nombre, prom: Math.round(prom3) });
-            });
-
-            const grupos = await Grupo.find({}).populate('maestroId', 'nombre').select('nombre semestre materia').lean();
-
-            contextoInstitucion = `
-DATOS DE LA INSTITUCIÓN (últimos 30 días):
-- Maestros activos: ${totalMaestros}
-- Alumnos activos: ${totalAlumnos}
-- Sesiones hoy: ${sesionesHoy}
-- Sesiones esta semana: ${sesiones7d}
-- Sesiones este mes: ${sesiones30d}
-- Promedio general de la institución: ${promedio}%
-- Alumnos en riesgo académico (<60%): ${alumnosRiesgo.length}
-${alumnosRiesgo.length ? `\nALUMNOS EN RIESGO:\n${alumnosRiesgo.map(a=>`  - ${a.nombre}: ${a.prom}%`).slice(0,10).join('\n')}` : ''}
-
-GRUPOS ACTIVOS:
-${grupos.map(g=>`- ${g.nombre} | ${g.materia} | ${g.semestre}`).join('\n')}`;
-        }
-
-        const mensajesHistorial = (historial||[]).slice(-8).map(m => ({
-            role: m.role === 'director' ? 'user' : 'assistant',
-            content: m.texto
-        }));
-
-        const messages = [
-            {
-                role: 'system',
-                content: `Eres un asistente estratégico para directores de instituciones educativas. Analizas datos de desempeño institucional y das recomendaciones ejecutivas, concretas y accionables.
-
-ESTILO:
-- Respuestas ejecutivas: directas, con datos, sin relleno
-- Usa métricas reales cuando las tengas
-- Si hay problemas, propón soluciones concretas con pasos
-- Máximo 4-5 puntos o 2-3 párrafos cortos
-- Habla de "tu institución", "tus alumnos", "tu equipo"
-
-${contextoInstitucion ? `\nDATOS ACTUALES DE LA INSTITUCIÓN:\n${contextoInstitucion}` : ''}`
-            },
-            ...mensajesHistorial,
-            { role: 'user', content: pregunta }
-        ];
-
-        const answer = await iaCall(messages, false, { tipo: 'chat' });
-        res.json({ answer });
-    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ PERFIL DEL ALUMNO ══
@@ -2141,7 +2286,7 @@ app.post('/api/maestro/registro', async (req, res) => {
 });
 
 // Login de maestro
-app.post('/api/maestro/login', async (req, res) => {
+app.post('/api/maestro/login', rateLimit(20, 60_000), async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { email, password } = req.body;
@@ -2195,8 +2340,20 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
         if (fuente.startsWith('http')) fuente = await extraerTextoWeb(fuente);
         const texto = typeof fuente === 'object' ? fuente.texto : fuente;
 
+        // Cargar grupo para obtener materia/semestre que especializarán el prompt
+        let grupoCtx = null;
+        if (grupoId && mongoose.connection.readyState) {
+            grupoCtx = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id })
+                .select('materia semestre').lean();
+        }
+
         // Generar clase + pool de 15 preguntas
-        const meta = { maestroId: req.maestro.id };
+        const meta = {
+            maestroId: req.maestro.id,
+            tipo: 'tarea',
+            materia: grupoCtx?.materia,
+            semestre: grupoCtx?.semestre
+        };
         const generated = await procesarConIAPool(texto, meta);
 
         const shortId = await shortIdUnico(Tarea);
@@ -2207,8 +2364,12 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
             titulo:    generated.titulo,
             abstract:  generated.abstract || '',
             resumen:   generated.resumen,
+            podcast:   generated.podcast || '',
+            glosario:  generated.glosario || [],
+            ejemplosPracticos: generated.ejemplosPracticos || [],
+            rubrica:   generated.rubrica || [],
             flashcards: generated.flashcards || [],
-            poolPreguntas: generated.quiz || [],
+            poolPreguntas: generated.poolPreguntas || generated.quiz || [],
             contexto:  texto.substring(0, 10000)
         });
 
@@ -2280,24 +2441,45 @@ app.get('/api/tarea/:shortId', async (req, res) => {
 
 // Crear tarea desde archivos (fotos/PDF) — igual que tarea texto pero con upload
 // ══ EXTRACCIÓN DE IMAGEN CENTRALIZADA — Gemini Vision + GROQ fallback ══
-const PROMPT_VISION = `Eres un asistente educativo experto en transcripción y extracción de contenido.
+const PROMPT_VISION = `Eres un asistente educativo experto en transcripción fiel y estructurada de material de estudio (apuntes, libros, pizarrones, láminas, ejercicios, mapas conceptuales, exámenes, diagramas).
 
-EXTRAE con precisión ABSOLUTA:
-- Todo texto escrito: títulos, subtítulos, párrafos, notas, definiciones
-- Fórmulas matemáticas, químicas o físicas (en formato legible)
-- Fechas, nombres, datos numéricos importantes
-- Listas, tablas, esquemas y diagramas (descríbelos con su contenido)
-- Cualquier contenido que un estudiante de preparatoria necesite aprender
+EXTRAE con precisión ABSOLUTA y organiza en secciones claras:
+1. TÍTULO principal del material (si aparece).
+2. DEFINICIONES: transcribe literal cada definición encontrada.
+3. EJEMPLOS / EJERCICIOS con enunciado y — si aparece — solución paso a paso.
+4. FÓRMULAS: reescríbelas en formato texto claro. Ej: "E = mc²", "pH = -log[H+]", "x = (-b ± √(b² - 4ac)) / 2a".
+5. TABLAS: transcríbelas fila por fila separando columnas con " | ".
+6. DIAGRAMAS / ESQUEMAS: descríbelos en palabras indicando qué representa cada elemento y las relaciones.
+7. DATOS CLAVE: fechas, nombres propios, unidades, magnitudes, constantes.
+8. TEXTO PLANO: todo lo demás del material que sea educativo.
 
-IGNORA completamente:
-- Menús, botones, iconos de navegación
-- Publicidad, banners, elementos decorativos  
-- Pies de página con información del sitio web
-- Elementos de interfaz de usuario
+IGNORA completamente menús, botones, iconos de navegación, cursores, publicidad, banners, marcas de agua, logotipos aislados, pies de página del sitio web, URLs de navegación, fechas de acceso, ruido fotográfico (dedos, sombras, bordes).
 
-Si es fotografía de apuntes o libro: transcribe el texto COMPLETO con máxima fidelidad.
-Si hay ecuaciones: escríbelas en formato texto claro (ej: "E = mc²").
-Responde SOLO con el contenido extraído, sin comentarios ni introducciones.`;
+FORMATO DE SALIDA (texto plano con encabezados en MAYÚSCULAS — así el siguiente procesador identifica las secciones):
+
+TÍTULO: ...
+DEFINICIONES:
+- ...
+EJEMPLOS:
+- Enunciado: ...
+  Solución: ...
+FÓRMULAS:
+- ...
+TABLAS:
+- Col1 | Col2 | Col3
+  v11 | v12 | v13
+DIAGRAMAS:
+- ...
+DATOS CLAVE:
+- ...
+TEXTO PLANO:
+<todo lo demás>
+
+REGLAS:
+• Si el material está en otro idioma, transcribe en el idioma original sin traducir.
+• Si partes son ilegibles, escribe "[ilegible]" y continúa.
+• No inventes contenido que no está en la imagen.
+• Responde SOLO con el contenido extraído siguiendo el formato, sin introducciones ni comentarios.`;
 
 async function extractImageText(buf, mime) {
     // Intentar Gemini 2.0 Flash Vision primero (mejor calidad)
@@ -2308,11 +2490,11 @@ async function extractImageText(buf, mime) {
                     { inlineData: { mimeType: mime, data: buf.toString('base64') } },
                     { text: PROMPT_VISION }
                 ]}],
-                generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
+                generationConfig: { temperature: 0.05, maxOutputTokens: 6144 }
             };
             const res = await axios.post(
                 `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-                body, { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+                body, { headers: { 'Content-Type': 'application/json' }, timeout: 45000 }
             );
             const text = res.data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
             if (text.trim().length > 20) return text;
@@ -2361,7 +2543,17 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
         if (!textoTotal.trim() || textoTotal.trim().length < 30)
             throw new Error('No se encontró suficiente texto en los archivos.');
 
-        const meta = { maestroId: req.maestro.id };
+        let grupoCtx = null;
+        if (grupoId && mongoose.connection.readyState) {
+            grupoCtx = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id })
+                .select('materia semestre').lean();
+        }
+        const meta = {
+            maestroId: req.maestro.id,
+            tipo: 'tarea',
+            materia: grupoCtx?.materia,
+            semestre: grupoCtx?.semestre
+        };
         const generated = await procesarConIAPool(textoTotal, meta);
         const shortId = await shortIdUnico(Tarea);
         const tarea = await Tarea.create({
@@ -2370,6 +2562,9 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
             abstract:  generated.abstract || '',
             resumen:   generated.resumen,
             podcast:   generated.podcast || '',
+            glosario:  generated.glosario || [],
+            ejemplosPracticos: generated.ejemplosPracticos || [],
+            rubrica:   generated.rubrica || [],
             flashcards: generated.flashcards || [],
             poolPreguntas: generated.poolPreguntas || generated.quiz || [],
             contexto:  textoTotal.substring(0, 10000)
@@ -2631,9 +2826,155 @@ function verifyAdmin(req, res, next) {
     const adminPwd   = (process.env.ADMIN_PASSWORD || '').trim();
     const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
     if (!adminPwd || !adminEmail) return res.status(503).json({ error: 'Panel admin no configurado.' });
-    if (pwd !== adminPwd || email !== adminEmail) return res.status(401).json({ error: 'Credenciales incorrectas.' });
+    const okEmail = safeEqual(email.toLowerCase(), adminEmail.toLowerCase());
+    const okPwd   = safeEqual(pwd, adminPwd);
+    if (!okEmail || !okPwd) return res.status(401).json({ error: 'Credenciales incorrectas.' });
     next();
 }
+
+// ══ CHAT IA ADMIN — asistente de operaciones con contexto agregado global ══
+app.post('/api/admin/chat', rateLimit(40, 60_000), verifyAdmin, async (req, res) => {
+    try {
+        const { pregunta: rawPreg, historial } = req.body;
+        const pregunta = sanitizeChatInput(rawPreg);
+        if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+
+        let ctx = 'Base de datos no disponible.';
+        if (mongoose.connection.readyState) {
+            const hace30 = new Date(Date.now() - 30*24*60*60*1000);
+            const hace7  = new Date(Date.now() - 7*24*60*60*1000);
+            const hoy    = new Date(new Date().setHours(0,0,0,0));
+
+            const [totalEscuelas, totalDirectores, totalMaestros, totalAlumnos, totalGrupos,
+                   totalTareas, ses30, ses7, sesToday, invitacionesAbiertas] = await Promise.all([
+                Escuela.countDocuments(),
+                Director.countDocuments(),
+                Maestro.countDocuments(),
+                Alumno.countDocuments({ activo: true }),
+                Grupo.countDocuments(),
+                Tarea.countDocuments(),
+                Sesion.countDocuments({ creadoEn: { $gte: hace30 } }),
+                Sesion.countDocuments({ creadoEn: { $gte: hace7 } }),
+                Sesion.countDocuments({ creadoEn: { $gte: hoy } }),
+                Invitacion.countDocuments({ usada: false })
+            ]);
+
+            const muestra = await Sesion.find({ creadoEn: { $gte: hace30 } }).select('pct grupoId').lean().limit(600);
+            const promGlobal = muestra.length ? Math.round(muestra.reduce((a,s)=>a+(s.pct||0),0)/muestra.length) : 0;
+
+            // Uso por escuela
+            const escuelas = await Escuela.find().select('nombre').lean();
+            const usoEscuelas = await Promise.all(escuelas.map(async e => {
+                const maestros = await Maestro.find({ escuelaId: e._id }).select('_id').lean();
+                const grupos   = await Grupo.find({ maestroId: { $in: maestros.map(m=>m._id) } }).select('_id').lean();
+                const cnt7     = await Sesion.countDocuments({ grupoId: { $in: grupos.map(g=>g._id) }, creadoEn: { $gte: hace7 } });
+                return { nombre: e.nombre, sesiones7d: cnt7, maestros: maestros.length, grupos: grupos.length };
+            }));
+            usoEscuelas.sort((a,b) => b.sesiones7d - a.sesiones7d);
+
+            // Maestros inactivos 14 días
+            const hace14 = new Date(Date.now() - 14*24*60*60*1000);
+            const maestrosDoc = await Maestro.find().select('nombre email escuelaId').lean();
+            const inactivos = [];
+            for (const m of maestrosDoc) {
+                const gids = (await Grupo.find({ maestroId: m._id }).select('_id').lean()).map(g=>g._id);
+                if (!gids.length) continue;
+                const ult = await Sesion.findOne({ grupoId: { $in: gids } }).sort({ creadoEn: -1 }).select('creadoEn').lean();
+                if (!ult || new Date(ult.creadoEn) < hace14) inactivos.push(m.nombre);
+            }
+
+            // Gasto estimado últimos 30 días
+            const costAgg = await UsageLog.aggregate([
+                { $match: { creadoEn: { $gte: hace30 } } },
+                { $group: { _id: null, total: { $sum: '$costoUSD' }, tokens: { $sum: '$tokensTotal' } } }
+            ]).catch(() => []);
+            const costo30 = costAgg[0]?.total || 0;
+            const tokens30 = costAgg[0]?.tokens || 0;
+
+            ctx = `SISTEMA TUTOR IA — Vista admin global
+• Escuelas: ${totalEscuelas} | Directores: ${totalDirectores} | Maestros: ${totalMaestros} | Alumnos: ${totalAlumnos}
+• Grupos: ${totalGrupos} | Tareas creadas: ${totalTareas} | Invitaciones pendientes: ${invitacionesAbiertas}
+• Sesiones: hoy=${sesToday}, 7d=${ses7}, 30d=${ses30}
+• Promedio global: ${promGlobal}%
+• Gasto IA 30d (estimado): $${costo30.toFixed(4)} USD | ${tokens30.toLocaleString()} tokens
+• Top 5 escuelas por uso 7d:
+${usoEscuelas.slice(0,5).map(e=>`  - ${e.nombre}: ${e.sesiones7d} sesiones (${e.maestros} maestros, ${e.grupos} grupos)`).join('\n') || '  (ninguna)'}
+• Maestros inactivos ≥14d: ${inactivos.length} → ${inactivos.slice(0,10).join(', ') || 'ninguno'}`;
+        }
+
+        const histMsgs = (historial || []).slice(-8).map(m => ({
+            role: m.role === 'admin' ? 'user' : 'assistant',
+            content: sanitizeChatInput(m.texto, 2000)
+        }));
+
+        const messages = [
+            { role: 'system', content: `Eres el asistente de operaciones del admin del sistema Tutor IA (Brand Collective MX). Tu rol es ayudar a analizar uso del sistema, detectar maestros inactivos, sugerir acciones de retención/activación, ayudar con flujos operativos (alta de escuelas, CSV de alumnos, invitaciones de maestros, reset de contraseñas, límites diarios) y responder preguntas sobre costos y salud del sistema.
+
+REGLAS:
+• Usa ÚNICAMENTE los datos del contexto. NUNCA inventes métricas ni nombres.
+• Si falta información, dilo y sugiere qué consultar.
+• Respuestas ejecutivas: máximo 4 puntos o 2-3 párrafos cortos.
+• Propón acciones concretas con nombres reales cuando los tengas.
+• Español mexicano, tono profesional pero directo.
+
+CONTEXTO DEL SISTEMA:
+${ctx}` },
+            ...histMsgs,
+            { role: 'user', content: pregunta }
+        ];
+
+        const answer = await iaCall(messages, false, { tipo: 'chat', cache: false });
+        res.json({ answer });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ RESET PASSWORD DIRECTOR POR ADMIN ══
+app.post('/api/admin/director/:directorId/reset-password', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const director = await Director.findById(req.params.directorId);
+        if (!director) return res.status(404).json({ error: 'Director no encontrado.' });
+
+        // Generar nueva contraseña aleatoria robusta y enviarla por email
+        const nueva = crypto.randomBytes(6).toString('base64').replace(/[^A-Za-z0-9]/g,'').substring(0,10) + '!';
+        director.passwordHash = await bcrypt.hash(nueva, 10);
+        director.resetToken = null;
+        director.resetTokenExp = null;
+        await director.save();
+
+        // Intentar notificar por email (Resend). Si no hay API key, devolver la contraseña al admin.
+        let emailEnviado = false;
+        try {
+            if (process.env.RESEND_API_KEY) {
+                const html = `
+                    <div style="font-family:system-ui,sans-serif;max-width:560px;margin:auto;padding:24px">
+                      <h2 style="color:#7c3aed">Contraseña restablecida — Tutor IA</h2>
+                      <p>Hola ${director.nombre}, el administrador del sistema restableció tu contraseña de director.</p>
+                      <p>Tu nueva contraseña temporal es:</p>
+                      <p style="font-family:monospace;font-size:20px;background:#f5f3ff;padding:14px;border-radius:8px;text-align:center">${nueva}</p>
+                      <p>Te recomendamos cambiarla inmediatamente después de iniciar sesión.</p>
+                      <p style="color:#6b7280;font-size:13px">Si no reconoces este cambio, contacta a soporte.</p>
+                    </div>`;
+                await axios.post('https://api.resend.com/emails', {
+                    from: 'Tutor IA <no-reply@brandcollectivemx.com>',
+                    to: [director.email],
+                    subject: 'Contraseña restablecida — Tutor IA',
+                    html
+                }, { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 10000 });
+                emailEnviado = true;
+            }
+        } catch(e) { console.warn('Email reset director admin falló:', e.message); }
+
+        res.json({
+            ok: true,
+            emailEnviado,
+            // Solo devolver la password al admin si no se pudo enviar email (para que la copie manualmente).
+            passwordTemporal: emailEnviado ? null : nueva,
+            email: director.email,
+            nombre: director.nombre
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // Stats generales
 app.get('/api/admin/stats', verifyAdmin, async (req, res) => {
@@ -3385,63 +3726,53 @@ app.get('/api/maestro/reporte-padres/:grupoId/:nombre', verifyToken, async (req,
 // Ya existe el endpoint, solo agregamos la llamada de notificación
 // ══ RESET DE CONTRASEÑA ══
 
-// Solicitar reset — genera token y envía email via Resend
+// ── Función centralizada de envío de email via Resend
+async function enviarEmailReset(destinatario, nombre, resetUrl, rol) {
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) return false;
+    const rolLabel = rol === 'maestro' ? 'Maestro' : rol === 'director' ? 'Director' : 'Alumno';
+    await axios.post('https://api.resend.com/emails', {
+        from:    'Tutor IA <no-reply@brandcollectivemx.com>',
+        to:      [destinatario],
+        subject: 'Restablecer contraseña — Tutor IA',
+        html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#080b14;color:#edf0f7;border-radius:16px">
+            <h2 style="color:#a78bfa;margin-bottom:8px">🔐 Restablecer contraseña</h2>
+            <p style="color:#8892a4;margin-bottom:8px">Hola <strong>${nombre}</strong>, recibimos tu solicitud para restablecer tu contraseña de <strong>${rolLabel}</strong>.</p>
+            <a href="${resetUrl}" style="display:inline-block;padding:14px 28px;background:#7c3aed;color:white;border-radius:10px;text-decoration:none;font-weight:700;margin:16px 0">Restablecer contraseña</a>
+            <p style="color:#5e738a;font-size:.82rem">Este link expira en 1 hora. Si no solicitaste esto, ignora este mensaje.</p>
+            <hr style="border:none;border-top:1px solid #1e2d45;margin:20px 0">
+            <p style="color:#5e738a;font-size:.75rem">Tutor IA · Brand Collective MX</p>
+        </div>`
+    }, { headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' } });
+    return true;
+}
+
+// ── Reset de contraseña para ALUMNOS
 app.post('/api/alumno/reset-password', async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { email } = req.body;
         if (!email) return res.status(400).json({ error: 'Email requerido.' });
-
         const alumno = await Alumno.findOne({ email: email.toLowerCase() });
-        // Siempre responder OK para no revelar si el email existe
         if (!alumno) return res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
-
-        // Generar token de 32 chars
         const token = [...Array(32)].map(() => Math.floor(Math.random()*16).toString(16)).join('');
         alumno.resetToken    = token;
-        alumno.resetTokenExp = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
+        alumno.resetTokenExp = new Date(Date.now() + 60*60*1000);
         await alumno.save();
-
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}/index.html?reset=${token}`;
-
-        // Enviar email via Resend
-        const RESEND_KEY = process.env.RESEND_API_KEY;
-        if (RESEND_KEY) {
-            await axios.post('https://api.resend.com/emails', {
-                from:    'Tutor IA <no-reply@brandcollectivemx.com>',
-                to:      [alumno.email],
-                subject: 'Restablecer contraseña — Tutor IA',
-                html: `
-                    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#080b14;color:#edf0f7;border-radius:16px">
-                        <h2 style="color:#a78bfa;margin-bottom:8px">🔐 Restablecer contraseña</h2>
-                        <p style="color:#8892a4;margin-bottom:24px">Hola <strong>${alumno.nombre}</strong>, recibimos tu solicitud para restablecer tu contraseña.</p>
-                        <a href="${resetUrl}" style="display:inline-block;padding:14px 28px;background:#7c3aed;color:white;border-radius:10px;text-decoration:none;font-weight:700;margin-bottom:24px">Restablecer contraseña</a>
-                        <p style="color:#5e738a;font-size:.82rem">Este link expira en 1 hora. Si no solicitaste esto, ignora este mensaje.</p>
-                        <hr style="border:none;border-top:1px solid #1e2d45;margin:24px 0">
-                        <p style="color:#5e738a;font-size:.75rem">Tutor IA · Powered by Brand Collective</p>
-                    </div>`
-            }, {
-                headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' }
-            });
-        }
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=alumno`;
+        await enviarEmailReset(alumno.email, alumno.nombre, resetUrl, 'alumno').catch(() => {});
         res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Confirmar reset con token
 app.post('/api/alumno/confirm-reset', async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { token, password } = req.body;
         if (!token || !password) return res.status(400).json({ error: 'Token y contraseña requeridos.' });
-        if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
-
-        const alumno = await Alumno.findOne({
-            resetToken: token,
-            resetTokenExp: { $gt: new Date() }
-        });
+        if (password.length < 6) return res.status(400).json({ error: 'Mínimo 6 caracteres.' });
+        const alumno = await Alumno.findOne({ resetToken: token, resetTokenExp: { $gt: new Date() } });
         if (!alumno) return res.status(400).json({ error: 'Token inválido o expirado.' });
-
         alumno.passwordHash  = await bcrypt.hash(password, 10);
         alumno.resetToken    = null;
         alumno.resetTokenExp = null;
@@ -3449,6 +3780,76 @@ app.post('/api/alumno/confirm-reset', async (req, res) => {
         res.json({ ok: true, msg: 'Contraseña actualizada. Ya puedes iniciar sesión.' });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── Reset de contraseña para MAESTROS
+app.post('/api/maestro/reset-password', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'Email requerido.' });
+        const maestro = await Maestro.findOne({ email: email.toLowerCase() });
+        if (!maestro) return res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
+        const token = [...Array(32)].map(() => Math.floor(Math.random()*16).toString(16)).join('');
+        maestro.resetToken    = token;
+        maestro.resetTokenExp = new Date(Date.now() + 60*60*1000);
+        await maestro.save();
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=maestro`;
+        await enviarEmailReset(maestro.email, maestro.nombre, resetUrl, 'maestro').catch(() => {});
+        res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/maestro/confirm-reset', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { token, password } = req.body;
+        if (!token || !password) return res.status(400).json({ error: 'Token y contraseña requeridos.' });
+        if (password.length < 6) return res.status(400).json({ error: 'Mínimo 6 caracteres.' });
+        const maestro = await Maestro.findOne({ resetToken: token, resetTokenExp: { $gt: new Date() } });
+        if (!maestro) return res.status(400).json({ error: 'Token inválido o expirado.' });
+        maestro.passwordHash  = await bcrypt.hash(password, 10);
+        maestro.resetToken    = null;
+        maestro.resetTokenExp = null;
+        await maestro.save();
+        res.json({ ok: true, msg: 'Contraseña actualizada. Ya puedes iniciar sesión como maestro.' });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Reset de contraseña para DIRECTORES
+app.post('/api/director/reset-password', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'Email requerido.' });
+        const director = await Director.findOne({ email: email.toLowerCase() });
+        if (!director) return res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
+        const token = [...Array(32)].map(() => Math.floor(Math.random()*16).toString(16)).join('');
+        director.resetToken    = token;
+        director.resetTokenExp = new Date(Date.now() + 60*60*1000);
+        await director.save();
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=director`;
+        await enviarEmailReset(director.email, director.nombre, resetUrl, 'director').catch(() => {});
+        res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/director/confirm-reset', async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { token, password } = req.body;
+        if (!token || !password) return res.status(400).json({ error: 'Token y contraseña requeridos.' });
+        if (password.length < 6) return res.status(400).json({ error: 'Mínimo 6 caracteres.' });
+        const director = await Director.findOne({ resetToken: token, resetTokenExp: { $gt: new Date() } });
+        if (!director) return res.status(400).json({ error: 'Token inválido o expirado.' });
+        director.passwordHash  = await bcrypt.hash(password, 10);
+        director.resetToken    = null;
+        director.resetTokenExp = null;
+        await director.save();
+        res.json({ ok: true, msg: 'Contraseña actualizada. Ya puedes iniciar sesión como director.' });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
 
 // ══ LOGROS DESBLOQUEABLES ══
 
