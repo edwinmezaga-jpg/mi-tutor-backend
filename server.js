@@ -74,12 +74,12 @@ function safeEqual(a, b) {
 // ── Modelos de IA disponibles
 const GEMINI_KEY  = process.env.GEMINI_API_KEY;
 const GROQ_KEY    = process.env.GROQ_API_KEY;
-const GEMINI_MODEL = 'gemini-2.5-flash-preview-05-14'; // mejor calidad
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const GROQ_MODEL   = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
 if (!GEMINI_KEY && !GROQ_KEY) console.error("⚠️  FALTA GEMINI_API_KEY o GROQ_API_KEY");
 if (!process.env.MONGODB_URI) console.warn("⚠️  FALTA MONGODB_URI");
-console.log(`🤖 Motor IA: ${GEMINI_KEY ? 'Gemini 2.5 Flash' : 'GROQ llama-3.3-70b'}`);
+console.log(`🤖 Motor IA: ${GEMINI_KEY ? `Gemini (${GEMINI_MODEL})` : `GROQ (${GROQ_MODEL})`}`);
 
 
 // ══ MONGODB ══
@@ -88,6 +88,21 @@ if (process.env.MONGODB_URI) {
         .then(() => console.log('✅ MongoDB conectado'))
         .catch(e => console.error('❌ MongoDB error:', e.message));
 }
+
+app.get('/api/health', (req, res) => {
+    res.json({
+        ok: true,
+        service: 'Tutor IA Backend',
+        node: process.version,
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        ai: {
+            provider: GEMINI_KEY ? 'gemini' : GROQ_KEY ? 'groq' : 'none',
+            geminiModel: GEMINI_KEY ? GEMINI_MODEL : null,
+            groqModel: GROQ_KEY ? GROQ_MODEL : null,
+            tokenUsageLogging: 'UsageLog MongoDB'
+        }
+    });
+});
 
 // ── Catálogos hardcodeados
 const SEMESTRES = ['1er Semestre','2do Semestre','3er Semestre','4to Semestre','5to Semestre','6to Semestre'];
@@ -1970,117 +1985,6 @@ Responde JSON:
         data.paraTarea     = recursos.filter(r => r.procesable && !r.esVideo);
         data.materialExtra = recursos.filter(r => !r.procesable || r.esVideo);
         data.recursos      = recursos;
-        res.json(data);
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-    try {
-        const { tema } = req.body;
-        if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
-
-        // ── Paso 1: IA genera sugerencias con URLs candidatas
-        const promptSugerencias = `Eres un experto en recursos educativos digitales para preparatoria en México.
-Un maestro necesita materiales de ALTA CALIDAD sobre: "${tema}".
-
-REGLAS CRÍTICAS PARA URLS:
-- Solo fuentes que existen con certeza absoluta
-- Wikipedia en español: SIEMPRE usa el formato https://es.wikipedia.org/wiki/TITULO_CON_GUIONES_BAJOS
-- Khan Academy: https://es.khanacademy.org/SECCION/TEMA (solo si sabes la URL exacta)
-- YouTube: https://www.youtube.com/results?search_query=TEMA+educativo (búsqueda, no video específico)
-- Para cualquier otro sitio: SOLO la homepage si no conoces el artículo exacto
-- NUNCA inventes rutas de artículos — es mejor la homepage que una URL falsa
-- PDFs universitarios: solo si conoces la URL exacta del PDF
-
-FUENTES CONFIABLES POR TIPO:
-- Artículos procesables: Wikipedia ES, Khan Academy ES, SEP (gob.mx), UNAM, enciclopedia.mx
-- Videos de apoyo: YouTube (búsqueda general), Canal Once, UNAM en línea
-- PDFs: repositorios .unam.mx, .ipn.mx, .sep.gob.mx
-
-Genera exactamente 4 recursos procesables y 3 videos de apoyo.
-
-FORMATO JSON ESTRICTO:
-{
-  "recursos": [
-    {
-      "titulo": "Título descriptivo del recurso",
-      "fuente": "Nombre del sitio",
-      "tipo": "Artículo" | "PDF" | "Video",
-      "nivel": "Preparatoria" | "Universidad" | "General",
-      "descripcion": "Qué cubre y por qué es útil en 1-2 oraciones",
-      "url": "https://url-real-y-verificable.com/ruta",
-      "idioma": "Español" | "Inglés",
-      "procesable": true | false,
-      "esVideo": false | true
-    }
-  ],
-  "consejo": "Consejo pedagógico breve sobre cómo usar estos recursos."
-}`;
-
-        const text = await iaCall([
-            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido, sin texto extra, sin markdown.' },
-            { role: 'user', content: promptSugerencias }
-        ], true);
-
-        const data = JSON.parse(text);
-        const recursos = data.recursos || [];
-
-        // ── Paso 2: Verificar URLs reales (HEAD request con timeout corto)
-        async function verificarURL(url) {
-            try {
-                const ctrl = new AbortController();
-                const timeout = setTimeout(() => ctrl.abort(), 5000);
-                const response = await axios.head(url, {
-                    signal: ctrl.signal,
-                    timeout: 5000,
-                    maxRedirects: 3,
-                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; educational-bot/1.0)' },
-                    validateStatus: s => s < 500 // 200-499 = URL existe
-                });
-                clearTimeout(timeout);
-                return response.status < 400; // 200-399 = accesible
-            } catch {
-                return false;
-            }
-        }
-
-        // Verificar en paralelo con límite de concurrencia
-        const verificados = await Promise.all(
-            recursos.map(async r => {
-                const activa = await verificarURL(r.url);
-                return { ...r, urlActiva: activa };
-            })
-        );
-
-        // ── Paso 3: Para URLs caídas de Wikipedia, construir URL alternativa conocida
-        const conFallback = verificados.map(r => {
-            if (!r.urlActiva) {
-                // Si era Wikipedia, construir URL de búsqueda como fallback
-                if (r.url.includes('wikipedia.org')) {
-                    const busqueda = encodeURIComponent(tema);
-                    r.url = `https://es.wikipedia.org/w/index.php?search=${busqueda}`;
-                    r.urlActiva = true;
-                    r.esFallback = true;
-                } else if (r.esVideo || r.tipo === 'Video') {
-                    // Videos sin URL válida → búsqueda en YouTube
-                    const busqueda = encodeURIComponent(`${tema} explicación educativa`);
-                    r.url = `https://www.youtube.com/results?search_query=${busqueda}`;
-                    r.urlActiva = true;
-                    r.esFallback = true;
-                } else {
-                    // Otros recursos con URL caída → búsqueda en Google académico
-                    const busqueda = encodeURIComponent(`${tema} sitio:edu OR sitio:gob.mx`);
-                    r.url = `https://www.google.com/search?q=${busqueda}`;
-                    r.urlActiva = true;
-                    r.esFallback = true;
-                }
-            }
-            return r;
-        });
-
-        // Separar en secciones
-        data.paraTarea     = conFallback.filter(r => r.procesable && !r.esVideo && r.tipo !== 'Video');
-        data.materialExtra = conFallback.filter(r => !r.procesable || r.esVideo || r.tipo === 'Video');
-        data.recursos      = conFallback;
-
         res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
