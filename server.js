@@ -15,8 +15,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = 'Beta 2.0.0.0';
-const PACKAGE_VERSION = '2.0.0-beta.0';
+const APP_VERSION = 'Beta 2.0.0.1';
+const PACKAGE_VERSION = '2.0.0-beta.1';
 
 if (!process.env.JWT_SECRET) {
     console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
@@ -208,14 +208,16 @@ const MATERIAS = [
 // ── Esquemas MongoDB
 
 // Invitación (generada por admin para cada maestro)
+const INVITACION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días
 const invitacionSchema = new mongoose.Schema({
-    codigo:    { type: String, unique: true, index: true },
-    nombre:    String,
-    email:     String,
-    grupos:    [{ semestre: String, materia: String }],
-    usada:     { type: Boolean, default: false },
-    maestroId: { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', default: null },
-    creadoEn:  { type: Date, default: Date.now }
+    codigo:           { type: String, unique: true, index: true },
+    nombre:           String,
+    email:            String,
+    grupos:           [{ semestre: String, materia: String }],
+    usada:            { type: Boolean, default: false },
+    maestroId:        { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', default: null },
+    creadoEn:         { type: Date, default: Date.now },
+    fechaVencimiento: { type: Date, default: () => new Date(Date.now() + INVITACION_TTL_MS) }
 });
 
 // Maestro
@@ -513,7 +515,8 @@ app.post('/api/admin/director', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { nombre, email, password, escuelaId } = req.body;
-        if (!nombre || !email || !password || !escuelaId) return res.status(400).json({ error: 'Faltan campos.' });
+        if (!nombre || !email || !password || !escuelaId) return res.status(400).json({ error: 'Faltan campos (nombre, email, contraseña y escuela son obligatorios).' });
+        if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
         const existe = await Director.findOne({ email: email.toLowerCase() });
         if (existe) return res.status(409).json({ error: 'Ya existe un director con ese email.' });
         const passwordHash = await bcrypt.hash(password, 10);
@@ -521,6 +524,7 @@ app.post('/api/admin/director', verifyAdmin, async (req, res) => {
         res.json({ director: { _id: director._id, nombre: director.nombre, email: director.email, escuelaId } });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
 
 app.patch('/api/admin/maestro/:maestroId/escuela', verifyAdmin, async (req, res) => {
     try {
@@ -2323,13 +2327,16 @@ app.post('/api/maestro/registro', async (req, res) => {
         const { password, codigoInvitacion } = req.body;
         if (!password || !codigoInvitacion) return res.status(400).json({ error: 'Faltan datos.' });
 
-        // Buscar invitación válida
-        const inv = await Invitacion.findOne({ codigo: codigoInvitacion, usada: false });
-        if (!inv) return res.status(403).json({ error: 'Código de invitación inválido o ya usado.' });
+        // Buscar invitación (puede existir pero estar usada o vencida)
+        const inv = await Invitacion.findOne({ codigo: codigoInvitacion });
+        if (!inv) return res.status(403).json({ error: 'Código de invitación inválido. Pide uno nuevo al admin.', code: 'INV_NOT_FOUND' });
+        if (inv.usada) return res.status(403).json({ error: 'Este código ya fue usado para crear una cuenta. Pide al admin que lo renueve o usa el login.', code: 'INV_USED' });
+        if (inv.fechaVencimiento && inv.fechaVencimiento < new Date())
+            return res.status(403).json({ error: 'La invitación venció. Pide al admin que la renueve.', code: 'INV_EXPIRED' });
 
         // Verificar que el email no tenga ya cuenta
         const existe = await Maestro.findOne({ email: inv.email });
-        if (existe) return res.status(409).json({ error: 'Ya existe una cuenta con ese email.' });
+        if (existe) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Usa el login en lugar de registro.', code: 'EMAIL_TAKEN' });
 
         // Crear maestro
         const passwordHash = await bcrypt.hash(password, 10);
@@ -2992,7 +2999,7 @@ function safeAiError(e) {
 app.post('/api/admin/diagnostico-ia', rateLimit(10, 60_000), verifyAdmin, async (req, res) => {
     const prompt = [
         { role: 'system', content: 'Responde breve en español mexicano.' },
-        { role: 'user', content: 'Di OK Tutor IA Beta 2.0.0.0 y menciona una recomendación educativa en una frase.' }
+        { role: 'user', content: `Di OK Tutor IA ${APP_VERSION} y menciona una recomendación educativa en una frase.` }
     ];
     const probar = async (nombre, fn, configurado, modelo) => {
         if (!configurado) return { proveedor: nombre, configurado: false, ok: false, modelo: null, error: 'Variable no configurada.' };
@@ -3143,27 +3150,34 @@ async function enviarEmailPasswordTemporal(destinatario, nombre, passwordTempora
     return true;
 }
 
-async function resetPasswordAdmin(Modelo, id, rol) {
+async function resetPasswordAdmin(Modelo, id, rol, passwordExplicita = null) {
     const usuario = await Modelo.findById(id);
     if (!usuario) return null;
 
-    const nueva = generarPasswordTemporal();
+    // Si el admin proporcionó una contraseña explícita, úsala. Si no, autogenera.
+    const nueva = (passwordExplicita && passwordExplicita.length >= 6)
+        ? passwordExplicita
+        : generarPasswordTemporal();
     usuario.passwordHash = await bcrypt.hash(nueva, 10);
-    usuario.resetToken = null;
-    usuario.resetTokenExp = null;
+    if ('resetToken' in usuario)    usuario.resetToken = null;
+    if ('resetTokenExp' in usuario) usuario.resetTokenExp = null;
     await usuario.save();
 
     let emailEnviado = false;
-    try {
-        emailEnviado = await enviarEmailPasswordTemporal(usuario.email, usuario.nombre, nueva, rol);
-    } catch(e) {
-        console.warn(`Email reset ${rol} admin falló:`, e.message);
+    // Solo enviar email automático si no fue contraseña explícita
+    if (!passwordExplicita) {
+        try {
+            emailEnviado = await enviarEmailPasswordTemporal(usuario.email, usuario.nombre, nueva, rol);
+        } catch(e) {
+            console.warn(`Email reset ${rol} admin falló:`, e.message);
+        }
     }
 
     return {
         ok: true,
         emailEnviado,
-        passwordTemporal: emailEnviado ? null : nueva,
+        // Si fue explícita, no la devolvemos (el admin ya la sabe)
+        passwordTemporal: passwordExplicita ? null : (emailEnviado ? null : nueva),
         email: usuario.email,
         nombre: usuario.nombre
     };
@@ -3173,7 +3187,8 @@ async function resetPasswordAdmin(Modelo, id, rol) {
 app.post('/api/admin/maestro/:maestroId/reset-password', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const result = await resetPasswordAdmin(Maestro, req.params.maestroId, 'maestro');
+        const { password } = req.body || {};
+        const result = await resetPasswordAdmin(Maestro, req.params.maestroId, 'maestro', password);
         if (!result) return res.status(404).json({ error: 'Maestro no encontrado.' });
         res.json(result);
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -3182,7 +3197,8 @@ app.post('/api/admin/maestro/:maestroId/reset-password', verifyAdmin, async (req
 app.post('/api/admin/alumno/:alumnoId/reset-password', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const result = await resetPasswordAdmin(Alumno, req.params.alumnoId, 'alumno');
+        const { password } = req.body || {};
+        const result = await resetPasswordAdmin(Alumno, req.params.alumnoId, 'alumno', password);
         if (!result) return res.status(404).json({ error: 'Alumno no encontrado.' });
         res.json(result);
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -3191,7 +3207,8 @@ app.post('/api/admin/alumno/:alumnoId/reset-password', verifyAdmin, async (req, 
 app.post('/api/admin/director/:directorId/reset-password', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const result = await resetPasswordAdmin(Director, req.params.directorId, 'director');
+        const { password } = req.body || {};
+        const result = await resetPasswordAdmin(Director, req.params.directorId, 'director', password);
         if (!result) return res.status(404).json({ error: 'Director no encontrado.' });
         res.json(result);
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -3334,14 +3351,42 @@ app.post('/api/admin/invitacion', verifyAdmin, async (req, res) => {
         }
 
         const inv = await Invitacion.create({ codigo, nombre, email: email.toLowerCase(), grupos });
-        res.json({ codigo: inv.codigo, nombre: inv.nombre, email: inv.email, grupos: inv.grupos });
+        res.json({ codigo: inv.codigo, nombre: inv.nombre, email: inv.email, grupos: inv.grupos, fechaVencimiento: inv.fechaVencimiento });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Borrar invitación no usada
+// Renovar / regenerar invitación: extiende fechaVencimiento 7 días y, si estaba usada, genera nuevo código
+app.post('/api/admin/invitacion/:id/renovar', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const inv = await Invitacion.findById(req.params.id);
+        if (!inv) return res.status(404).json({ error: 'Invitación no encontrada.' });
+
+        // Si estaba usada, generamos un código nuevo y permitimos un re-registro
+        // (esto es útil cuando el maestro perdió su contraseña o nunca completó el flujo).
+        if (inv.usada) {
+            // Asegurar que ya no exista una cuenta atada a ese email
+            const existe = await Maestro.findOne({ email: (inv.email || '').toLowerCase() });
+            if (existe) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Usa "Resetear contraseña" del maestro en su lugar.', code: 'EMAIL_TAKEN' });
+
+            let codigo = generarCodigoInvitacion(inv.nombre || 'maestro');
+            while (await Invitacion.findOne({ codigo })) {
+                codigo = generarCodigoInvitacion(inv.nombre || 'maestro');
+            }
+            inv.codigo = codigo;
+            inv.usada = false;
+            inv.maestroId = null;
+        }
+        inv.fechaVencimiento = new Date(Date.now() + INVITACION_TTL_MS);
+        await inv.save();
+        res.json({ codigo: inv.codigo, fechaVencimiento: inv.fechaVencimiento, usada: inv.usada });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar invitación (forzado: incluso si está usada, útil para limpieza)
 app.delete('/api/admin/invitacion/:codigo', verifyAdmin, async (req, res) => {
     try {
-        await Invitacion.deleteOne({ codigo: req.params.codigo, usada: false });
+        await Invitacion.deleteOne({ codigo: req.params.codigo });
         res.json({ ok: true });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
