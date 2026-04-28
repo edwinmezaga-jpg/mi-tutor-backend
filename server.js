@@ -4115,7 +4115,7 @@ app.post('/api/alumno/reset-password', async (req, res) => {
         alumno.resetToken    = token;
         alumno.resetTokenExp = new Date(Date.now() + 60*60*1000);
         await alumno.save();
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=alumno`;
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://brandcollectivemx.com/tutor'}?reset=${token}&rol=alumno`;
         await enviarEmailReset(alumno.email, alumno.nombre, resetUrl, 'alumno').catch(() => {});
         res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -4149,7 +4149,7 @@ app.post('/api/maestro/reset-password', async (req, res) => {
         maestro.resetToken    = token;
         maestro.resetTokenExp = new Date(Date.now() + 60*60*1000);
         await maestro.save();
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=maestro`;
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://brandcollectivemx.com/tutor'}?reset=${token}&rol=maestro`;
         await enviarEmailReset(maestro.email, maestro.nombre, resetUrl, 'maestro').catch(() => {});
         res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -4183,7 +4183,7 @@ app.post('/api/director/reset-password', async (req, res) => {
         director.resetToken    = token;
         director.resetTokenExp = new Date(Date.now() + 60*60*1000);
         await director.save();
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://cigd.com.mx/tutor'}?reset=${token}&rol=director`;
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://brandcollectivemx.com/tutor'}?reset=${token}&rol=director`;
         await enviarEmailReset(director.email, director.nombre, resetUrl, 'director').catch(() => {});
         res.json({ ok: true, msg: 'Si el email existe, recibirás instrucciones.' });
     } catch(e) { res.status(500).json({ error: e.message }); }
