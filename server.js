@@ -15,6 +15,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const APP_VERSION = 'Beta 2.0.0.0';
+const PACKAGE_VERSION = '2.0.0-beta.0';
 
 if (!process.env.JWT_SECRET) {
     console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
@@ -71,6 +73,82 @@ function safeEqual(a, b) {
     return crypto.timingSafeEqual(bufA, bufB);
 }
 
+function parseOptionalDate(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function lateInfo(fechaVencimiento, now = new Date()) {
+    const venc = parseOptionalDate(fechaVencimiento);
+    if (!venc || now <= venc) {
+        return { fechaVencimiento: venc, entregaTarde: false, retrasoMinutos: 0 };
+    }
+    return {
+        fechaVencimiento: venc,
+        entregaTarde: true,
+        retrasoMinutos: Math.max(1, Math.ceil((now - venc) / 60000))
+    };
+}
+
+function formatRetraso(mins = 0) {
+    const total = Math.max(0, Number(mins) || 0);
+    const dias = Math.floor(total / 1440);
+    const horas = Math.floor((total % 1440) / 60);
+    const minutos = total % 60;
+    const partes = [];
+    if (dias) partes.push(`${dias} d`);
+    if (horas) partes.push(`${horas} h`);
+    if (minutos || !partes.length) partes.push(`${minutos} min`);
+    return partes.join(' ');
+}
+
+function buildLocalDateTime(fecha, hora) {
+    if (!fecha) return null;
+    return parseOptionalDate(`${fecha}T${hora || '23:59'}:00-07:00`);
+}
+
+function chatGuardrail(rol, pregunta, hasContext = true) {
+    const q = (pregunta || '').toLowerCase();
+    const forbidden = [
+        'novia','novio','ligar','apuesta','casino','crypto','bitcoin','dinero rapido',
+        'hack','hackear','arma','drogas','sexo','porno','politica partidista','chisme',
+        'instagram','tiktok','facebook','whatsapp personal','meme','videojuego'
+    ];
+    if (forbidden.some(w => q.includes(w))) {
+        const scope = {
+            alumno: 'tu clase, tarea activa y dudas educativas relacionadas',
+            maestro: 'tus grupos, tareas, alumnos, resultados y estrategias pedagogicas',
+            director: 'tu institucion, maestros, grupos, alumnos y metricas escolares',
+            admin: 'operacion del sistema, usuarios, costos, despliegue y soporte'
+        }[rol] || 'este modulo';
+        return { ok: false, answer: `No puedo ayudarte con eso desde este chat. Aqui solo puedo apoyar con ${scope}.` };
+    }
+    if (rol === 'alumno' && !hasContext) {
+        return { ok: false, answer: 'No puedo responder sin una clase o tarea activa. Abre una tarea o genera una clase y con gusto te ayudo sobre ese material.' };
+    }
+    return { ok: true };
+}
+
+function explicacionFallback(q = {}) {
+    const opciones = q.o || q.opciones || [];
+    const correcta = Number.isInteger(q.r) ? q.r : q.correcta;
+    const respuesta = opciones[correcta] || 'la opción correcta';
+    return `La respuesta correcta es "${respuesta}" porque es la opción que coincide directamente con el concepto evaluado. Revisa la definición central y compara por qué las otras opciones cambian, exageran o confunden una parte del tema.`;
+}
+
+function normalizeQuestion(q = {}) {
+    const opciones = Array.isArray(q.o) ? q.o : Array.isArray(q.opciones) ? q.opciones : [];
+    const correcta = Number.isInteger(q.r) ? q.r : Number.isInteger(q.correcta) ? q.correcta : 0;
+    const base = { ...q, o: opciones, r: correcta };
+    base.explicacion = String(q.explicacion || q.porQueCorrecta || q.retroalimentacion || '').trim() || explicacionFallback(base);
+    return base;
+}
+
+function normalizeQuestions(arr = []) {
+    return (Array.isArray(arr) ? arr : []).map(normalizeQuestion);
+}
+
 // ── Modelos de IA disponibles
 const GEMINI_KEY  = process.env.GEMINI_API_KEY;
 const GROQ_KEY    = process.env.GROQ_API_KEY;
@@ -93,10 +171,24 @@ app.get('/api/health', (req, res) => {
     res.json({
         ok: true,
         service: 'Tutor IA Backend',
+        version: APP_VERSION,
+        packageVersion: PACKAGE_VERSION,
         node: process.version,
         mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        env: {
+            jwtSecret: !!process.env.JWT_SECRET,
+            mongodbUri: !!process.env.MONGODB_URI,
+            geminiKey: !!GEMINI_KEY,
+            groqKey: !!GROQ_KEY,
+            adminEmail: !!process.env.ADMIN_EMAIL,
+            adminPassword: !!process.env.ADMIN_PASSWORD
+        },
         ai: {
             provider: GEMINI_KEY ? 'gemini' : GROQ_KEY ? 'groq' : 'none',
+            primary: GEMINI_KEY ? 'gemini' : GROQ_KEY ? 'groq' : 'none',
+            fallback: GROQ_KEY ? 'groq' : null,
+            geminiConfigured: !!GEMINI_KEY,
+            groqConfigured: !!GROQ_KEY,
             geminiModel: GEMINI_KEY ? GEMINI_MODEL : null,
             groqModel: GROQ_KEY ? GROQ_MODEL : null,
             tokenUsageLogging: 'UsageLog MongoDB'
@@ -172,6 +264,9 @@ const sesionSchema = new mongoose.Schema({
     pct:        Number,
     codigo:     String,
     tareaId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Tarea', default: null, index: true },
+    fechaVencimiento: { type: Date, default: null },
+    entregaTarde: { type: Boolean, default: false },
+    retrasoMinutos: { type: Number, default: 0 },
     creadoEn:   { type: Date, default: Date.now, expires: 60 * 60 * 24 * 180 } // 180 días TTL
 });
 const Sesion = mongoose.models.Sesion || mongoose.model('Sesion', sesionSchema);
@@ -201,6 +296,9 @@ const tareaSchema = new mongoose.Schema({
     flashcards: [Object],
     poolPreguntas: [Object], // 15-18 preguntas; alumnos ven 6 random
     contexto:  String,
+    fechaVencimiento: { type: Date, default: null },
+    origen: { type: String, enum: ['link','texto','archivo'], default: 'texto' },
+    archivoResumen: String,
     vistas:    { type: Number, default: 0 },
     creadoEn:  { type: Date, default: Date.now, expires: 60 * 60 * 24 * 180 }
 });
@@ -225,10 +323,30 @@ const examenSchema = new mongoose.Schema({
     instrucciones: String,
     preguntas:   [Object], // combinadas de múltiples tareas
     tiempoLimite: { type: Number, default: 60 }, // minutos
+    fechaVencimiento: { type: Date, default: null },
+    origen: { type: String, enum: ['tareas','archivo'], default: 'tareas' },
+    fuenteTexto: String,
     activo:      { type: Boolean, default: true },
     creadoEn:    { type: Date, default: Date.now, expires: 60 * 60 * 24 * 90 }
 });
 const Examen = mongoose.models.Examen || mongoose.model('Examen', examenSchema);
+
+const examenEntregaSchema = new mongoose.Schema({
+    shortId:   { type: String, unique: true, index: true },
+    examenId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Examen', index: true },
+    alumnoId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Alumno', default: null, index: true },
+    nombre:    String,
+    grupoId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    respuestas: [Object],
+    correctas: Number,
+    total:     Number,
+    pct:       Number,
+    fechaVencimiento: { type: Date, default: null },
+    entregaTarde: { type: Boolean, default: false },
+    retrasoMinutos: { type: Number, default: 0 },
+    creadoEn:  { type: Date, default: Date.now, expires: 60 * 60 * 24 * 90 }
+});
+const ExamenEntrega = mongoose.models.ExamenEntrega || mongoose.model('ExamenEntrega', examenEntregaSchema);
 
 // Sala de Quiz en Vivo
 const salaQuizSchema = new mongoose.Schema({
@@ -1299,7 +1417,7 @@ OTROS CAMPOS:
 • "abstract": 2-3 oraciones gancho: "En esta clase aprenderás X y por qué importa en tu vida."
 • "glosario": 6-10 términos adicionales con definición breve (1 línea cada uno).
 • "ejemplosPracticos": 3 objetos {problema, solucion_paso_a_paso}. La solución debe explicarse en 3-5 pasos numerados.
-• "quiz": 6 preguntas distribuidas por nivel Bloom en este orden: [recordar, comprender, aplicar, analizar, evaluar, crear]. Añade un campo "bloom" con el nivel. Los 4 distractores deben ser errores plausibles reales (NO absurdos). Índice "r" basado en 0.
+• "quiz": 6 preguntas distribuidas por nivel Bloom en este orden: [recordar, comprender, aplicar, analizar, evaluar, crear]. Añade un campo "bloom" con el nivel. Los 4 distractores deben ser errores plausibles reales (NO absurdos). Índice "r" basado en 0. Cada pregunta debe incluir "explicacion": 1-2 frases claras explicando por qué la opción correcta es correcta y qué confusión común evita.
 • "flashcards": 8 tarjetas. Reverso con: definición precisa + ejemplo concreto + por qué importa.
 • "fuentes": 2-4 referencias cortas donde el estudiante puede profundizar (nombre + tipo, sin URLs inventadas).
 
@@ -1319,12 +1437,12 @@ FORMATO JSON EXACTO (SOLO JSON):
     {"problema": "...", "solucion_paso_a_paso": "..."}
   ],
   "quiz": [
-    {"p": "Pregunta nivel recordar", "o": ["A","B","C","D"], "r": 0, "bloom": "recordar"},
-    {"p": "Pregunta nivel comprender", "o": ["A","B","C","D"], "r": 1, "bloom": "comprender"},
-    {"p": "Pregunta nivel aplicar", "o": ["A","B","C","D"], "r": 2, "bloom": "aplicar"},
-    {"p": "Pregunta nivel analizar", "o": ["A","B","C","D"], "r": 3, "bloom": "analizar"},
-    {"p": "Pregunta nivel evaluar", "o": ["A","B","C","D"], "r": 0, "bloom": "evaluar"},
-    {"p": "Pregunta nivel crear", "o": ["A","B","C","D"], "r": 2, "bloom": "crear"}
+    {"p": "Pregunta nivel recordar", "o": ["A","B","C","D"], "r": 0, "bloom": "recordar", "explicacion": "La opción A es correcta porque..."},
+    {"p": "Pregunta nivel comprender", "o": ["A","B","C","D"], "r": 1, "bloom": "comprender", "explicacion": "La opción B es correcta porque..."},
+    {"p": "Pregunta nivel aplicar", "o": ["A","B","C","D"], "r": 2, "bloom": "aplicar", "explicacion": "La opción C es correcta porque..."},
+    {"p": "Pregunta nivel analizar", "o": ["A","B","C","D"], "r": 3, "bloom": "analizar", "explicacion": "La opción D es correcta porque..."},
+    {"p": "Pregunta nivel evaluar", "o": ["A","B","C","D"], "r": 0, "bloom": "evaluar", "explicacion": "La opción A es correcta porque..."},
+    {"p": "Pregunta nivel crear", "o": ["A","B","C","D"], "r": 2, "bloom": "crear", "explicacion": "La opción C es correcta porque..."}
   ],
   "flashcards": [
     {"anverso": "Término 1", "reverso": "Definición. Ejemplo: ... Importancia: ..."},
@@ -1364,6 +1482,7 @@ ${texto.substring(0, 30000)}`
     }
 
     data.contexto = texto.substring(0, 10000);
+    data.quiz = normalizeQuestions(data.quiz || []);
     if (videoId) data.videoId = videoId;
     return data;
 }
@@ -1408,6 +1527,7 @@ OTROS CAMPOS:
     ▸ Prohibido repetir la misma estructura gramatical en 2 preguntas consecutivas.
     ▸ Nunca uses "ninguna de las anteriores" ni "todas las anteriores".
     ▸ Añade un campo "bloom" con el nivel específico.
+    ▸ Añade un campo "explicacion" en cada pregunta: 1-2 frases didácticas que expliquen por qué la respuesta correcta es correcta y cuál es el error común detrás de los distractores.
 • "flashcards" (8): anverso=término, reverso=definición precisa + ejemplo concreto + por qué importa.
 • "rubrica" (3 criterios): para evaluación escrita. Cada criterio con 4 niveles {nivel, descripcion}.
 
@@ -1420,21 +1540,21 @@ FORMATO JSON EXACTO:
   "glosario": [{"termino":"T1","definicion":"..."}, ...],
   "ejemplosPracticos": [{"problema":"...","solucion_paso_a_paso":"1) ... 2) ..."}, ...],
   "poolPreguntas": [
-    {"p":"P1 básica","o":["A","B","C","D"],"r":0,"bloom":"recordar"},
-    {"p":"P2 básica","o":["A","B","C","D"],"r":1,"bloom":"recordar"},
-    {"p":"P3 básica","o":["A","B","C","D"],"r":2,"bloom":"comprender"},
-    {"p":"P4 básica","o":["A","B","C","D"],"r":3,"bloom":"comprender"},
-    {"p":"P5 básica","o":["A","B","C","D"],"r":0,"bloom":"comprender"},
-    {"p":"P6 intermedia","o":["A","B","C","D"],"r":1,"bloom":"aplicar"},
-    {"p":"P7 intermedia","o":["A","B","C","D"],"r":2,"bloom":"aplicar"},
-    {"p":"P8 intermedia","o":["A","B","C","D"],"r":3,"bloom":"analizar"},
-    {"p":"P9 intermedia","o":["A","B","C","D"],"r":0,"bloom":"analizar"},
-    {"p":"P10 intermedia","o":["A","B","C","D"],"r":1,"bloom":"analizar"},
-    {"p":"P11 avanzada","o":["A","B","C","D"],"r":2,"bloom":"evaluar"},
-    {"p":"P12 avanzada","o":["A","B","C","D"],"r":3,"bloom":"evaluar"},
-    {"p":"P13 avanzada","o":["A","B","C","D"],"r":0,"bloom":"crear"},
-    {"p":"P14 avanzada","o":["A","B","C","D"],"r":1,"bloom":"crear"},
-    {"p":"P15 avanzada","o":["A","B","C","D"],"r":2,"bloom":"crear"}
+    {"p":"P1 básica","o":["A","B","C","D"],"r":0,"bloom":"recordar","explicacion":"La opción A es correcta porque..."},
+    {"p":"P2 básica","o":["A","B","C","D"],"r":1,"bloom":"recordar","explicacion":"La opción B es correcta porque..."},
+    {"p":"P3 básica","o":["A","B","C","D"],"r":2,"bloom":"comprender","explicacion":"La opción C es correcta porque..."},
+    {"p":"P4 básica","o":["A","B","C","D"],"r":3,"bloom":"comprender","explicacion":"La opción D es correcta porque..."},
+    {"p":"P5 básica","o":["A","B","C","D"],"r":0,"bloom":"comprender","explicacion":"La opción A es correcta porque..."},
+    {"p":"P6 intermedia","o":["A","B","C","D"],"r":1,"bloom":"aplicar","explicacion":"La opción B es correcta porque..."},
+    {"p":"P7 intermedia","o":["A","B","C","D"],"r":2,"bloom":"aplicar","explicacion":"La opción C es correcta porque..."},
+    {"p":"P8 intermedia","o":["A","B","C","D"],"r":3,"bloom":"analizar","explicacion":"La opción D es correcta porque..."},
+    {"p":"P9 intermedia","o":["A","B","C","D"],"r":0,"bloom":"analizar","explicacion":"La opción A es correcta porque..."},
+    {"p":"P10 intermedia","o":["A","B","C","D"],"r":1,"bloom":"analizar","explicacion":"La opción B es correcta porque..."},
+    {"p":"P11 avanzada","o":["A","B","C","D"],"r":2,"bloom":"evaluar","explicacion":"La opción C es correcta porque..."},
+    {"p":"P12 avanzada","o":["A","B","C","D"],"r":3,"bloom":"evaluar","explicacion":"La opción D es correcta porque..."},
+    {"p":"P13 avanzada","o":["A","B","C","D"],"r":0,"bloom":"crear","explicacion":"La opción A es correcta porque..."},
+    {"p":"P14 avanzada","o":["A","B","C","D"],"r":1,"bloom":"crear","explicacion":"La opción B es correcta porque..."},
+    {"p":"P15 avanzada","o":["A","B","C","D"],"r":2,"bloom":"crear","explicacion":"La opción C es correcta porque..."}
   ],
   "flashcards": [
     {"anverso":"T1","reverso":"Definición. Ejemplo: ... Importancia: ..."},
@@ -1464,10 +1584,16 @@ ${sourceText.substring(0, 30000)}`
     const text = await iaCall(messages, true, { ...meta, tipo: 'tarea' });
     try {
         const clean = text.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
-        return JSON.parse(clean);
+        const data = JSON.parse(clean);
+        data.poolPreguntas = normalizeQuestions(data.poolPreguntas || data.quiz || []);
+        return data;
     } catch(e) {
         const jsonMatch = text.match(/\{[\s\S]+\}/);
-        if (jsonMatch) return JSON.parse(jsonMatch[0]);
+        if (jsonMatch) {
+            const data = JSON.parse(jsonMatch[0]);
+            data.poolPreguntas = normalizeQuestions(data.poolPreguntas || data.quiz || []);
+            return data;
+        }
         throw new Error('La IA retornó formato inválido. Intenta de nuevo.');
     }
 }
@@ -1560,6 +1686,8 @@ app.post('/api/chat', rateLimit(40, 60_000), async (req, res) => {
         } else if (context) {
             contextoCompleto = context.substring(0, 5000);
         }
+        const guard = chatGuardrail('alumno', question, !!contextoCompleto);
+        if (!guard.ok) return res.json({ answer: guard.answer, guardrail: true });
 
         const histMsgs = (historial||[]).slice(-10).map(m=>({ role: m.role==='user'?'user':'assistant', content: m.texto }));
 
@@ -1590,6 +1718,8 @@ app.post('/api/maestro/chat', rateLimit(40, 60_000), verifyToken, async (req, re
         const { grupoId, pregunta: rawPreg, historial } = req.body;
         const pregunta = sanitizeChatInput(rawPreg);
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+        const guard = chatGuardrail('maestro', pregunta, true);
+        if (!guard.ok) return res.json({ answer: guard.answer, guardrail: true });
 
         // Construir contexto completo y real del grupo
         let contextoGrupo = 'No se seleccionó grupo. Solo puedes dar consejos generales sobre pedagogía.';
@@ -1676,6 +1806,8 @@ app.post('/api/director/chat', rateLimit(40, 60_000), verifyDirector, async (req
         const { pregunta: rawPreg, historial } = req.body;
         const pregunta = sanitizeChatInput(rawPreg);
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+        const guard = chatGuardrail('director', pregunta, true);
+        if (!guard.ok) return res.json({ answer: guard.answer, guardrail: true });
 
         // Datos REALES de la institución del director (no de toda la BD)
         const escuelaId = req.director.escuelaId;
@@ -1989,6 +2121,37 @@ Responde JSON:
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/tutor/explicar-error', rateLimit(20, 60_000), verifyAlumno, async (req, res) => {
+    try {
+        const pregunta = sanitizeChatInput(req.body.pregunta, 1200);
+        const opciones = Array.isArray(req.body.opciones) ? req.body.opciones.map(o => sanitizeChatInput(String(o), 500)) : [];
+        const seleccionada = Number.isInteger(req.body.seleccionada) ? req.body.seleccionada : null;
+        const correcta = Number.isInteger(req.body.correcta) ? req.body.correcta : 0;
+        const explicacionBase = sanitizeChatInput(req.body.explicacion || '', 1200);
+        const contexto = sanitizeChatInput(req.body.contexto || '', 2500);
+        if (!pregunta || !opciones.length) return res.status(400).json({ error: 'Falta la pregunta u opciones.' });
+        const fallback = explicacionBase || explicacionFallback({ p: pregunta, o: opciones, r: correcta });
+
+        try {
+            const answer = await iaCall([
+                { role: 'system', content: 'Eres un tutor de preparatoria mexicano. Explicas errores de opción múltiple con paciencia, sin burlarte, y ayudas al alumno a entender el concepto. Responde en máximo 4 bullets cortos.' },
+                { role: 'user', content: `Pregunta: ${pregunta}
+Opciones:
+${opciones.map((o,i)=>`${i}. ${o}`).join('\n')}
+Respuesta del alumno: ${seleccionada === null ? 'sin responder' : `${seleccionada}. ${opciones[seleccionada] || ''}`}
+Respuesta correcta: ${correcta}. ${opciones[correcta] || ''}
+Explicación base: ${fallback}
+Contexto de clase: ${contexto || 'No disponible'}
+
+Explica por qué se equivocó, por qué la correcta sí responde la pregunta y qué debe repasar.` }
+            ], false, { tipo: 'chat', cache: false, alumnoId: req.alumno.id, temperature: 0.35 });
+            return res.json({ answer, provider: GEMINI_KEY ? 'gemini' : GROQ_KEY ? 'groq' : 'none' });
+        } catch(e) {
+            return res.json({ answer: fallback, provider: 'fallback-local', warning: 'IA no disponible; se mostró la explicación base.' });
+        }
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // Clase compartida
 app.post('/api/clase', async (req, res) => {
     try {
@@ -2021,6 +2184,11 @@ app.post('/api/sesion', async (req, res) => {
 
         let grupoNombre = '';
         if (grupoId) { const g = await Grupo.findById(grupoId); if (g) grupoNombre = g.nombre; }
+        let vencimientoInfo = lateInfo(null);
+        if (tareaId) {
+            const tarea = await Tarea.findById(tareaId).select('fechaVencimiento').lean();
+            vencimientoInfo = lateInfo(tarea?.fechaVencimiento);
+        }
 
         const shortId = await shortIdUnico(Sesion);
         await Sesion.create({
@@ -2031,7 +2199,8 @@ app.post('/api/sesion', async (req, res) => {
             respuestasQuiz: respuestasQuiz || [],
             chatMensajes: chatMensajes || [],
             correctas, total, pct, codigo,
-            tareaId: tareaId || null
+            tareaId: tareaId || null,
+            ...vencimientoInfo
         });
 
         // Verificar logros si hay alumnoId
@@ -2060,7 +2229,7 @@ app.post('/api/sesion', async (req, res) => {
             } catch(e) { console.warn('Error verificando logros:', e.message); }
         }
 
-        res.json({ shortId, nuevosLogros });
+        res.json({ shortId, nuevosLogros, ...vencimientoInfo, retrasoTexto: formatRetraso(vencimientoInfo.retrasoMinutos) });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2236,7 +2405,7 @@ app.get('/api/maestro/grupos', verifyToken, async (req, res) => {
 app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const { input, grupoId } = req.body;
+        const { input, grupoId, fechaVencimiento } = req.body;
         if (!input) return res.status(400).json({ error: 'Falta contenido.' });
 
         // Resolver texto si es URL (retorna string o {texto, videoId, esVideo} para YouTube)
@@ -2273,8 +2442,10 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
             ejemplosPracticos: generated.ejemplosPracticos || [],
             rubrica:   generated.rubrica || [],
             flashcards: generated.flashcards || [],
-            poolPreguntas: generated.poolPreguntas || generated.quiz || [],
-            contexto:  texto.substring(0, 10000)
+            poolPreguntas: normalizeQuestions(generated.poolPreguntas || generated.quiz || []),
+            contexto:  texto.substring(0, 10000),
+            fechaVencimiento: parseOptionalDate(fechaVencimiento),
+            origen: input.trim().startsWith('http') ? 'link' : 'texto'
         });
 
         res.json({ shortId: tarea.shortId, titulo: tarea.titulo, abstract: tarea.abstract });
@@ -2286,7 +2457,7 @@ app.get('/api/maestro/tareas', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const tareas = await Tarea.find({ maestroId: req.maestro.id })
-            .select('shortId titulo abstract grupoId vistas creadoEn')
+            .select('shortId titulo abstract grupoId vistas creadoEn fechaVencimiento origen')
             .sort({ creadoEn: -1 });
 
         // Contar sesiones vinculadas a cada tarea
@@ -2325,7 +2496,7 @@ app.get('/api/tarea/:shortId', async (req, res) => {
         if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada.' });
 
         // Seleccionar 6 preguntas aleatorias del pool
-        const pool = tarea.poolPreguntas || [];
+        const pool = normalizeQuestions(tarea.poolPreguntas || []);
         const shuffled = [...pool].sort(() => Math.random() - 0.5);
         const quiz6 = shuffled.slice(0, Math.min(6, shuffled.length));
 
@@ -2338,6 +2509,10 @@ app.get('/api/tarea/:shortId', async (req, res) => {
             quiz:       quiz6,
             contexto:   tarea.contexto,
             grupoId:    tarea.grupoId,
+            tareaId:    tarea._id,
+            fechaVencimiento: tarea.fechaVencimiento,
+            entregaTarde: lateInfo(tarea.fechaVencimiento).entregaTarde,
+            retrasoMinutos: lateInfo(tarea.fechaVencimiento).retrasoMinutos,
             esTarea:    true   // flag para que el frontend sepa el origen
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -2427,7 +2602,7 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         if (!archivos.length) return res.status(400).json({ error: 'No se recibieron archivos.' });
 
-        const { grupoId } = req.body;
+        const { grupoId, fechaVencimiento } = req.body;
         let textoTotal = '';
 
         for (const archivo of archivos) {
@@ -2470,12 +2645,84 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
             ejemplosPracticos: generated.ejemplosPracticos || [],
             rubrica:   generated.rubrica || [],
             flashcards: generated.flashcards || [],
-            poolPreguntas: generated.poolPreguntas || generated.quiz || [],
-            contexto:  textoTotal.substring(0, 10000)
+            poolPreguntas: normalizeQuestions(generated.poolPreguntas || generated.quiz || []),
+            contexto:  textoTotal.substring(0, 10000),
+            fechaVencimiento: parseOptionalDate(fechaVencimiento),
+            origen: 'archivo',
+            archivoResumen: textoTotal.substring(0, 1200)
         });
         res.json({ shortId: tarea.shortId, titulo: tarea.titulo, abstract: tarea.abstract });
     } catch (e) { res.status(500).json({ error: e.message }); }
     finally { for (const p of tmpPaths) await unlink(p).catch(() => {}); }
+});
+
+app.post('/api/maestro/tarea/:shortId/laboratorio-ia', rateLimit(20, 60_000), verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const tarea = await Tarea.findOne({ shortId: req.params.shortId, maestroId: req.maestro.id });
+        if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada.' });
+
+        const modo = String(req.body.modo || 'pulir_pool');
+        const instruccion = sanitizeChatInput(req.body.instruccion || '', 1800);
+        const preguntaIndex = Number.isInteger(req.body.preguntaIndex) ? req.body.preguntaIndex : null;
+        const aplicarCambios = !!req.body.aplicarCambios;
+        const modos = {
+            corregir_apuntes: 'corrige y mejora claridad de apuntes/resumen sin cambiar el sentido',
+            pulir_pool: 'mejora la calidad del pool de preguntas, distractores y explicaciones',
+            generar_variantes: 'genera variantes equivalentes de preguntas sin repetir conceptos',
+            mejorar_explicaciones: 'mejora explicaciones de respuesta correcta y errores comunes',
+            revisar_bloom: 'revisa dificultad, Bloom y progresion pedagogica'
+        };
+        if (!modos[modo]) return res.status(400).json({ error: 'Modo de laboratorio no soportado.' });
+
+        const poolBase = normalizeQuestions(tarea.poolPreguntas || []);
+        const objetivo = preguntaIndex !== null ? [poolBase[preguntaIndex]].filter(Boolean) : poolBase;
+        const messages = [
+            { role: 'system', content: 'Eres un co-diseñador pedagógico para maestros de preparatoria mexicana. Responde solo JSON válido. Nunca inventes contenido fuera del material base.' },
+            { role: 'user', content: `Modo: ${modo} (${modos[modo]})
+Instrucción del maestro: ${instruccion || 'Mejora calidad, claridad y precisión.'}
+
+Tarea: ${tarea.titulo}
+Resumen actual:
+${String(tarea.resumen || '').replace(/<[^>]+>/g,' ').substring(0, 5000)}
+
+Preguntas objetivo:
+${JSON.stringify(objetivo.length ? objetivo : poolBase.slice(0, 15)).substring(0, 12000)}
+
+Devuelve JSON:
+{
+  "resumenSugerido": "texto opcional si aplica",
+  "poolSugerido": [{"p":"...","o":["A","B","C","D"],"r":0,"bloom":"recordar","explicacion":"..."}],
+  "notas": ["cambio 1","cambio 2"]
+}
+
+Si el modo no requiere cambiar resumen, deja resumenSugerido vacío. Si no requiere cambiar pool, deja poolSugerido como [].` }
+        ];
+        const raw = await iaCall(messages, true, { tipo: 'tarea', maestroId: req.maestro.id, cache: false, temperature: 0.35 });
+        const clean = raw.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+        const preview = JSON.parse(clean.match(/\{[\s\S]+\}/)?.[0] || clean);
+        const poolSugerido = normalizeQuestions(preview.poolSugerido || []);
+        const resumenSugerido = String(preview.resumenSugerido || '').trim();
+
+        if (aplicarCambios) {
+            const update = {};
+            if (resumenSugerido) update.resumen = resumenSugerido;
+            if (poolSugerido.length) {
+                if (preguntaIndex !== null && poolBase[preguntaIndex]) {
+                    const nuevoPool = [...poolBase];
+                    nuevoPool[preguntaIndex] = poolSugerido[0];
+                    update.poolPreguntas = nuevoPool;
+                } else {
+                    update.poolPreguntas = poolSugerido;
+                }
+            }
+            if (!Object.keys(update).length) return res.json({ ok: true, aplicado: false, preview: { ...preview, poolSugerido } });
+            await Tarea.updateOne({ _id: tarea._id }, { $set: update });
+            return res.json({ ok: true, aplicado: true, preview: { ...preview, poolSugerido } });
+        }
+
+        res.json({ ok: true, aplicado: false, preview: { ...preview, poolSugerido } });
+    } catch(e) { res.status(500).json({ error: e.message || 'No se pudo procesar el laboratorio IA.' }); }
 });
 app.post('/api/maestro/agregar-grupo', verifyToken, async (req, res) => {
     try {
@@ -2736,12 +2983,51 @@ function verifyAdmin(req, res, next) {
     next();
 }
 
+function safeAiError(e) {
+    const status = e.response?.status;
+    const msg = e.response?.data?.error?.message || e.message || 'Error desconocido';
+    return `${status ? `HTTP ${status}: ` : ''}${String(msg).replace(/AIza[\w-]+|gsk_[\w-]+/g, '[redacted]').substring(0, 240)}`;
+}
+
+app.post('/api/admin/diagnostico-ia', rateLimit(10, 60_000), verifyAdmin, async (req, res) => {
+    const prompt = [
+        { role: 'system', content: 'Responde breve en español mexicano.' },
+        { role: 'user', content: 'Di OK Tutor IA Beta 2.0.0.0 y menciona una recomendación educativa en una frase.' }
+    ];
+    const probar = async (nombre, fn, configurado, modelo) => {
+        if (!configurado) return { proveedor: nombre, configurado: false, ok: false, modelo: null, error: 'Variable no configurada.' };
+        const inicio = Date.now();
+        try {
+            const texto = await fn(prompt, false, { tipo: 'chat', cache: false, temperature: 0.1 });
+            return { proveedor: nombre, configurado: true, ok: true, modelo, ms: Date.now() - inicio, muestra: texto.substring(0, 180) };
+        } catch(e) {
+            return { proveedor: nombre, configurado: true, ok: false, modelo, ms: Date.now() - inicio, error: safeAiError(e) };
+        }
+    };
+    const [gemini, groq] = await Promise.all([
+        probar('gemini', geminiCall, !!GEMINI_KEY, GEMINI_MODEL),
+        probar('groq', groqCall, !!GROQ_KEY, GROQ_MODEL)
+    ]);
+    res.json({
+        ok: gemini.ok || groq.ok,
+        version: APP_VERSION,
+        estrategia: 'Gemini principal; Groq backup.',
+        primary: GEMINI_KEY ? 'gemini' : GROQ_KEY ? 'groq' : 'none',
+        fallback: GROQ_KEY ? 'groq' : null,
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        gemini,
+        groq
+    });
+});
+
 // ══ CHAT IA ADMIN — asistente de operaciones con contexto agregado global ══
 app.post('/api/admin/chat', rateLimit(40, 60_000), verifyAdmin, async (req, res) => {
     try {
         const { pregunta: rawPreg, historial } = req.body;
         const pregunta = sanitizeChatInput(rawPreg);
         if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta.' });
+        const guard = chatGuardrail('admin', pregunta, true);
+        if (!guard.ok) return res.json({ answer: guard.answer, guardrail: true });
 
         let ctx = 'Base de datos no disponible.';
         if (mongoose.connection.readyState) {
@@ -2832,51 +3118,82 @@ ${ctx}` },
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ══ RESET PASSWORD DIRECTOR POR ADMIN ══
+function generarPasswordTemporal() {
+    return crypto.randomBytes(9).toString('base64url').substring(0, 12) + '!';
+}
+
+async function enviarEmailPasswordTemporal(destinatario, nombre, passwordTemporal, rol) {
+    if (!process.env.RESEND_API_KEY) return false;
+    const rolLabel = rol === 'maestro' ? 'maestro' : rol === 'director' ? 'director' : 'alumno';
+    const html = `
+        <div style="font-family:system-ui,sans-serif;max-width:560px;margin:auto;padding:24px">
+          <h2 style="color:#7c3aed">Contraseña restablecida - Tutor IA</h2>
+          <p>Hola ${nombre}, el administrador del sistema restableció tu contraseña de ${rolLabel}.</p>
+          <p>Tu nueva contraseña temporal es:</p>
+          <p style="font-family:monospace;font-size:20px;background:#f5f3ff;padding:14px;border-radius:8px;text-align:center">${passwordTemporal}</p>
+          <p>Te recomendamos cambiarla después de iniciar sesión.</p>
+          <p style="color:#6b7280;font-size:13px">Si no reconoces este cambio, contacta a soporte.</p>
+        </div>`;
+    await axios.post('https://api.resend.com/emails', {
+        from: 'Tutor IA <no-reply@brandcollectivemx.com>',
+        to: [destinatario],
+        subject: 'Contraseña restablecida - Tutor IA',
+        html
+    }, { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 10000 });
+    return true;
+}
+
+async function resetPasswordAdmin(Modelo, id, rol) {
+    const usuario = await Modelo.findById(id);
+    if (!usuario) return null;
+
+    const nueva = generarPasswordTemporal();
+    usuario.passwordHash = await bcrypt.hash(nueva, 10);
+    usuario.resetToken = null;
+    usuario.resetTokenExp = null;
+    await usuario.save();
+
+    let emailEnviado = false;
+    try {
+        emailEnviado = await enviarEmailPasswordTemporal(usuario.email, usuario.nombre, nueva, rol);
+    } catch(e) {
+        console.warn(`Email reset ${rol} admin falló:`, e.message);
+    }
+
+    return {
+        ok: true,
+        emailEnviado,
+        passwordTemporal: emailEnviado ? null : nueva,
+        email: usuario.email,
+        nombre: usuario.nombre
+    };
+}
+
+// ══ RESET PASSWORD POR ADMIN ══
+app.post('/api/admin/maestro/:maestroId/reset-password', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const result = await resetPasswordAdmin(Maestro, req.params.maestroId, 'maestro');
+        if (!result) return res.status(404).json({ error: 'Maestro no encontrado.' });
+        res.json(result);
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/alumno/:alumnoId/reset-password', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const result = await resetPasswordAdmin(Alumno, req.params.alumnoId, 'alumno');
+        if (!result) return res.status(404).json({ error: 'Alumno no encontrado.' });
+        res.json(result);
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/director/:directorId/reset-password', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const director = await Director.findById(req.params.directorId);
-        if (!director) return res.status(404).json({ error: 'Director no encontrado.' });
-
-        // Generar nueva contraseña aleatoria robusta y enviarla por email
-        const nueva = crypto.randomBytes(6).toString('base64').replace(/[^A-Za-z0-9]/g,'').substring(0,10) + '!';
-        director.passwordHash = await bcrypt.hash(nueva, 10);
-        director.resetToken = null;
-        director.resetTokenExp = null;
-        await director.save();
-
-        // Intentar notificar por email (Resend). Si no hay API key, devolver la contraseña al admin.
-        let emailEnviado = false;
-        try {
-            if (process.env.RESEND_API_KEY) {
-                const html = `
-                    <div style="font-family:system-ui,sans-serif;max-width:560px;margin:auto;padding:24px">
-                      <h2 style="color:#7c3aed">Contraseña restablecida — Tutor IA</h2>
-                      <p>Hola ${director.nombre}, el administrador del sistema restableció tu contraseña de director.</p>
-                      <p>Tu nueva contraseña temporal es:</p>
-                      <p style="font-family:monospace;font-size:20px;background:#f5f3ff;padding:14px;border-radius:8px;text-align:center">${nueva}</p>
-                      <p>Te recomendamos cambiarla inmediatamente después de iniciar sesión.</p>
-                      <p style="color:#6b7280;font-size:13px">Si no reconoces este cambio, contacta a soporte.</p>
-                    </div>`;
-                await axios.post('https://api.resend.com/emails', {
-                    from: 'Tutor IA <no-reply@brandcollectivemx.com>',
-                    to: [director.email],
-                    subject: 'Contraseña restablecida — Tutor IA',
-                    html
-                }, { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 10000 });
-                emailEnviado = true;
-            }
-        } catch(e) { console.warn('Email reset director admin falló:', e.message); }
-
-        res.json({
-            ok: true,
-            emailEnviado,
-            // Solo devolver la password al admin si no se pudo enviar email (para que la copie manualmente).
-            passwordTemporal: emailEnviado ? null : nueva,
-            email: director.email,
-            nombre: director.nombre
-        });
+        const result = await resetPasswordAdmin(Director, req.params.directorId, 'director');
+        if (!result) return res.status(404).json({ error: 'Director no encontrado.' });
+        res.json(result);
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3254,24 +3571,29 @@ async function notificarMaestro(grupoId, mensaje) {
 app.post('/api/maestro/examen', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const { grupoId, tareaIds, titulo, instrucciones, preguntasPorTarea, tiempoLimite } = req.body;
+        const { grupoId, tareaIds, titulo, instrucciones, preguntasPorTarea, tiempoLimite, fechaVencimiento } = req.body;
         if (!tareaIds?.length) return res.status(400).json({ error: 'Selecciona al menos una tarea.' });
-
-        const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id });
-        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
 
         // Obtener tareas y mezclar preguntas
         const tareas = await Tarea.find({
             _id: { $in: tareaIds },
             maestroId: req.maestro.id
-        }).select('titulo poolPreguntas').lean();
+        }).select('titulo poolPreguntas grupoId').lean();
 
         if (!tareas.length) return res.status(404).json({ error: 'No se encontraron tareas.' });
+        if (tareas.length !== tareaIds.length) return res.status(403).json({ error: 'Una o mas tareas no pertenecen a tu cuenta.' });
+        const grupoIdFinal = grupoId || tareas.find(t => t.grupoId)?.grupoId;
+        if (!grupoIdFinal) return res.status(400).json({ error: 'Las tareas del examen deben estar asignadas a un grupo.' });
+        const tareasOtroGrupo = tareas.some(t => String(t.grupoId || '') !== String(grupoIdFinal));
+        if (tareasOtroGrupo) return res.status(400).json({ error: 'Selecciona tareas del mismo grupo para crear el examen.' });
+
+        const grupo = await Grupo.findOne({ _id: grupoIdFinal, maestroId: req.maestro.id });
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
 
         const ppt = preguntasPorTarea || 5; // preguntas por tarea
         let preguntas = [];
         tareas.forEach(t => {
-            const pool = t.poolPreguntas || [];
+            const pool = normalizeQuestions(t.poolPreguntas || []);
             // Mezclar aleatoriamente y tomar ppt preguntas
             const mezcladas = pool.sort(() => Math.random() - 0.5).slice(0, ppt);
             mezcladas.forEach(q => preguntas.push({ ...q, fuente: t.titulo }));
@@ -3281,13 +3603,67 @@ app.post('/api/maestro/examen', verifyToken, async (req, res) => {
 
         const shortId = await shortIdUnico(Examen);
         const examen = await Examen.create({
-            shortId, maestroId: req.maestro.id, grupoId,
+            shortId, maestroId: req.maestro.id, grupoId: grupoIdFinal,
             titulo: titulo || `Examen Final — ${grupo.nombre}`,
             instrucciones: instrucciones || 'Responde cada pregunta. Tienes tiempo limitado.',
-            preguntas, tiempoLimite: tiempoLimite || 60, activo: true
+            preguntas, tiempoLimite: tiempoLimite || 60,
+            fechaVencimiento: parseOptionalDate(fechaVencimiento),
+            origen: 'tareas',
+            activo: true
         });
         res.json({ shortId: examen.shortId, titulo: examen.titulo, totalPreguntas: preguntas.length });
     } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/maestro/examen-archivo', verifyToken, upload.array('archivos', 10), async (req, res) => {
+    const archivos = req.files || [];
+    const tmpPaths = archivos.map(f => f.path);
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        if (!archivos.length) return res.status(400).json({ error: 'No se recibieron archivos.' });
+        const { grupoId, titulo, instrucciones, preguntasPorTarea, tiempoLimite, fechaVencimiento } = req.body;
+        const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id });
+        if (!grupo) return res.status(404).json({ error: 'Grupo no encontrado.' });
+
+        let textoTotal = '';
+        for (const archivo of archivos) {
+            const buf = await readFile(archivo.path);
+            const mime = archivo.mimetype;
+            let texto = '';
+            if (mime === 'application/pdf') {
+                try { texto = (await pdfParse(buf)).text; } catch { texto = ''; }
+            } else if (mime.startsWith('image/')) {
+                texto = await extractImageText(buf, mime);
+            } else {
+                texto = buf.toString('utf-8');
+            }
+            if (texto.trim()) textoTotal += texto + '\n\n';
+        }
+        if (!textoTotal.trim() || textoTotal.trim().length < 30)
+            throw new Error('No se encontró suficiente texto en los archivos.');
+
+        const generated = await procesarConIAPool(textoTotal, {
+            maestroId: req.maestro.id, tipo: 'tarea',
+            materia: grupo.materia, semestre: grupo.semestre
+        });
+        const ppt = Math.max(1, Math.min(parseInt(preguntasPorTarea) || 10, 20));
+        const preguntas = normalizeQuestions(generated.poolPreguntas || generated.quiz || []).slice(0, ppt);
+        if (!preguntas.length) throw new Error('La IA no generó preguntas suficientes para el examen.');
+
+        const shortId = await shortIdUnico(Examen);
+        const examen = await Examen.create({
+            shortId, maestroId: req.maestro.id, grupoId,
+            titulo: titulo || generated.titulo || `Examen — ${grupo.nombre}`,
+            instrucciones: instrucciones || 'Responde cada pregunta. Tienes tiempo limitado.',
+            preguntas, tiempoLimite: parseInt(tiempoLimite) || 60,
+            fechaVencimiento: parseOptionalDate(fechaVencimiento),
+            origen: 'archivo',
+            fuenteTexto: textoTotal.substring(0, 10000),
+            activo: true
+        });
+        res.json({ shortId: examen.shortId, titulo: examen.titulo, totalPreguntas: preguntas.length });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+    finally { for (const p of tmpPaths) await unlink(p).catch(() => {}); }
 });
 
 // Listar exámenes del maestro
@@ -3296,6 +3672,8 @@ app.get('/api/maestro/examenes', verifyToken, async (req, res) => {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const examenes = await Examen.find({ maestroId: req.maestro.id })
             .sort({ creadoEn: -1 }).select('-preguntas').lean();
+        const entregaCounts = await Promise.all(examenes.map(e => ExamenEntrega.countDocuments({ examenId: e._id })));
+        examenes.forEach((e, i) => { e.entregas = entregaCounts[i]; });
         const grupos = await Grupo.find({ maestroId: req.maestro.id }).select('_id nombre').lean();
         res.json({ examenes, grupos });
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -3308,10 +3686,84 @@ app.get('/api/examen/:shortId', async (req, res) => {
         const examen = await Examen.findOne({ shortId: req.params.shortId, activo: true }).lean();
         if (!examen) return res.status(404).json({ error: 'Examen no encontrado o inactivo.' });
         // Ocultar respuestas correctas al alumno
-        const preguntasSinRespuesta = examen.preguntas.map(q => ({
-            p: q.p, o: q.o, fuente: q.fuente // sin q.r (respuesta correcta)
+        const preguntasSinRespuesta = normalizeQuestions(examen.preguntas).map(q => ({
+            p: q.p, o: q.o, fuente: q.fuente, bloom: q.bloom // sin q.r ni explicacion antes de entregar
         }));
-        res.json({ ...examen, preguntas: preguntasSinRespuesta });
+        const estado = lateInfo(examen.fechaVencimiento);
+        res.json({ ...examen, preguntas: preguntasSinRespuesta, entregaTarde: estado.entregaTarde, retrasoMinutos: estado.retrasoMinutos });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/examen/:shortId/entregar', verifyAlumno, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const examen = await Examen.findOne({ shortId: req.params.shortId, activo: true });
+        if (!examen) return res.status(404).json({ error: 'Examen no encontrado o inactivo.' });
+        const alumno = await Alumno.findById(req.alumno.id).select('nombre grupoId').lean();
+        if (!alumno) return res.status(404).json({ error: 'Alumno no encontrado.' });
+        if (examen.grupoId && alumno.grupoId && String(examen.grupoId) !== String(alumno.grupoId)) {
+            return res.status(403).json({ error: 'Este examen no pertenece a tu grupo.' });
+        }
+        const entregaExistente = await ExamenEntrega.findOne({ examenId: examen._id, alumnoId: alumno._id })
+            .select('shortId respuestas correctas total pct entregaTarde retrasoMinutos').lean();
+        if (entregaExistente) {
+            return res.json({
+                shortId: entregaExistente.shortId,
+                detalles: entregaExistente.respuestas || [],
+                correctas: entregaExistente.correctas,
+                total: entregaExistente.total,
+                pct: entregaExistente.pct,
+                entregaTarde: entregaExistente.entregaTarde,
+                retrasoMinutos: entregaExistente.retrasoMinutos,
+                retrasoTexto: formatRetraso(entregaExistente.retrasoMinutos),
+                yaEntregado: true
+            });
+        }
+        const respuestasInput = req.body.respuestas || {};
+        let correctas = 0;
+        const preguntasNormalizadas = normalizeQuestions(examen.preguntas);
+        const respuestas = preguntasNormalizadas.map((q, i) => {
+            const raw = respuestasInput[i];
+            const seleccionada = (raw === undefined || raw === null || raw === '') ? null : Number(raw);
+            const esCorrecta = Number.isInteger(seleccionada) && seleccionada === q.r;
+            if (esCorrecta) correctas++;
+            return {
+                pregunta: q.p,
+                opciones: q.o || [],
+                seleccionada,
+                correcta: q.r,
+                esCorrecta,
+                fuente: q.fuente || '',
+                bloom: q.bloom || '',
+                explicacion: q.explicacion || explicacionFallback(q)
+            };
+        });
+        const total = preguntasNormalizadas.length;
+        const pct = total ? Math.round((correctas / total) * 100) : 0;
+        const estado = lateInfo(examen.fechaVencimiento);
+        const shortId = await shortIdUnico(ExamenEntrega);
+        const entrega = await ExamenEntrega.create({
+            shortId, examenId: examen._id, alumnoId: alumno._id,
+            nombre: alumno.nombre, grupoId: examen.grupoId || alumno.grupoId,
+            respuestas, correctas, total, pct, ...estado
+        });
+        res.json({
+            shortId: entrega.shortId, detalles: respuestas, correctas, total, pct,
+            entregaTarde: estado.entregaTarde,
+            retrasoMinutos: estado.retrasoMinutos,
+            retrasoTexto: formatRetraso(estado.retrasoMinutos)
+        });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/maestro/examen/:shortId/entregas', verifyToken, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const examen = await Examen.findOne({ shortId: req.params.shortId, maestroId: req.maestro.id }).select('_id titulo');
+        if (!examen) return res.status(404).json({ error: 'Examen no encontrado.' });
+        const entregas = await ExamenEntrega.find({ examenId: examen._id })
+            .sort({ creadoEn: -1 }).select('-respuestas').lean();
+        res.json({ examen: { shortId: req.params.shortId, titulo: examen.titulo }, entregas });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
