@@ -15,8 +15,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = 'Beta 2.0.0.4';
-const PACKAGE_VERSION = '2.0.0-beta.4';
+const APP_VERSION = 'Beta 2.0.0.5';
+const PACKAGE_VERSION = '2.0.0-beta.5';
 
 if (!process.env.JWT_SECRET) {
     console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
@@ -1343,24 +1343,118 @@ async function verificarUrlsParalelo(urls, timeoutMs = 5000) {
     return new Set(resultados.filter(r => r.ok).map(r => r.url));
 }
 
-// ── Búsqueda de recursos educativos con Gemini Grounding + verificación de URLs
-async function buscarRecursosEducativosIA(tema) {
+// ── Verificación robusta de YouTube por oEmbed (HEAD a youtube.com siempre devuelve 200,
+// no es confiable. oEmbed devuelve 401 para privados y 404 para eliminados.)
+async function verificarYouTube(videoId) {
+    if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return { ok: false };
+    try {
+        const r = await axios.get(
+            `https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v=${videoId}`,
+            { timeout: 6000, validateStatus: () => true }
+        );
+        if (r.status === 200 && r.data?.title) {
+            return { ok: true, titulo: r.data.title, autor: r.data.author_name, thumbnail: r.data.thumbnail_url };
+        }
+        return { ok: false, motivo: r.status === 401 ? 'privado' : (r.status === 404 ? 'eliminado' : 'no-disponible') };
+    } catch { return { ok: false, motivo: 'timeout' }; }
+}
+
+// Filtra y excluye Wikipedia/Wikimedia
+function esFuenteProhibida(url) {
+    if (!url) return true;
+    const u = url.toLowerCase();
+    return u.includes('wikipedia.org') || u.includes('wikimedia.org') || u.includes('wikiwand.com');
+}
+
+// Extrae el videoId de un URL de YouTube (si aplica)
+function extraerVideoIdDeUrl(url) {
+    if (!url || !esYoutube(url)) return null;
+    return extraerYoutubeId(url);
+}
+
+// Verificación batch: solo mantiene videos verificados por oEmbed + URLs no-Wikipedia accesibles
+async function filtrarYverificarRecursos(data) {
+    if (!data) return data;
+    // 1) Bloquear Wikipedia
+    data.videos    = (data.videos    || []).filter(v => !esFuenteProhibida(v.url));
+    data.articulos = (data.articulos || []).filter(a => !esFuenteProhibida(a.url));
+
+    // 2) Verificar YouTube por oEmbed en paralelo
+    const videoChecks = await Promise.all(
+        (data.videos || []).map(async v => {
+            const id = extraerVideoIdDeUrl(v.url);
+            if (!id) return null;
+            const check = await verificarYouTube(id);
+            return check.ok ? { ...v, tituloReal: check.titulo, autorReal: check.autor, videoId: id } : null;
+        })
+    );
+    data.videos = videoChecks.filter(Boolean);
+
+    // 3) Verificar artículos por HEAD (más permisivo)
+    if (data.articulos.length) {
+        const validas = await verificarUrlsParalelo(data.articulos.map(a => a.url), 5000);
+        data.articulos = data.articulos.filter(a => validas.has(a.url));
+    }
+
+    // 4) Diversidad de dominios en artículos (máx 1 por dominio)
+    const dominiosVistos = new Set();
+    data.articulos = data.articulos.filter(a => {
+        try {
+            const d = new URL(a.url).hostname.replace(/^www\./, '');
+            if (dominiosVistos.has(d)) return false;
+            dominiosVistos.add(d);
+            return true;
+        } catch { return false; }
+    });
+    return data;
+}
+
+// ── Helper: extraer URLs reales del groundingMetadata de Gemini
+// (estas son las URLs que Gemini efectivamente consultó en google_search;
+// son la única fuente confiable, todo lo demás puede ser inventado)
+function extraerUrlsDeGroundingMetadata(candidate) {
+    const urls = new Set();
+    try {
+        const meta = candidate?.groundingMetadata || candidate?.grounding_metadata;
+        if (!meta) return urls;
+        const chunks = meta.groundingChunks || meta.grounding_chunks || [];
+        for (const c of chunks) {
+            const u = c?.web?.uri || c?.web?.url;
+            if (u) urls.add(u);
+        }
+        // En algunas versiones también vienen `searchEntryPoint`/`webSearchQueries`
+        const supports = meta.groundingSupports || meta.grounding_supports || [];
+        for (const s of supports) {
+            (s?.references || s?.referenceIndices || []).forEach(_ => {});
+        }
+    } catch(e) { console.warn('extraerUrlsDeGroundingMetadata error:', e.message); }
+    return urls;
+}
+
+// ── Búsqueda de recursos educativos con Gemini Grounding REAL + verificación oEmbed
+async function buscarRecursosEducativosIA(tema, intento = 1) {
     if (!GEMINI_KEY) return null;
     try {
+        const queryHint = intento === 1
+            ? `Busca recursos educativos REALES y actuales en español mexicano sobre: "${tema}"`
+            : `2do intento - busca SOLO en estos sitios institucionales: site:khanacademy.org OR site:gob.mx OR site:unam.mx OR site:ipn.mx OR site:conacyt.mx OR site:sep.gob.mx OR site:ted.com — sobre el tema: "${tema}"`;
+
         const body = {
             contents: [{ role: "user", parts: [{ text:
-`Busca recursos educativos REALES y actuales en español mexicano sobre: "${tema}"
+`${queryHint}
 
 FUENTES OBLIGATORIAS (usa google_search):
-1. Videos de YouTube de canales educativos confiables (Khan Academy, UNAM, IPN, TED-Ed en español, Kurzgesagt en español, Crash Course en español, Date un Vlog, Derivando, QuantumFracture, Math2Me, DW en español, BBC Mundo).
-2. Artículos de fuentes serias (Wikipedia en español, Khan Academy, National Geographic, Britannica, gob.mx, UNAM, CONACYT, IPN).
-3. PDFs o documentos académicos gratuitos si existen.
+1. Videos de YouTube de canales educativos institucionales VERIFICABLES (Khan Academy en español, UNAM, IPN, TED-Ed en español, Crash Course en español, Math2Me, DW Documental, BBC Mundo, Veritasium en español, Kurzgesagt en español, QuantumFracture, Date un Vlog, Derivando).
+2. Artículos de fuentes ACADÉMICAS o INSTITUCIONALES (gob.mx, unam.mx, ipn.mx, conacyt.mx, sep.gob.mx, khanacademy.org, britannica.com, nationalgeographic.com, scholar.google.com, jstor.org, springer.com).
+3. PDFs académicos gratuitos si existen.
 
 REGLAS ABSOLUTAS:
-• PROHIBIDO inventar URLs. Solo devuelve URLs que vengan DIRECTAMENTE de resultados de google_search — si no tienes resultado seguro para una categoría, devuelve array vacío [].
+• PROHIBIDO Wikipedia y Wikimedia (en cualquier idioma). NO los incluyas.
+• PROHIBIDO inventar URLs. Solo devuelve URLs que vengan DIRECTAMENTE de resultados de google_search.
 • Los IDs de YouTube deben ser exactamente los de los resultados de búsqueda — nunca inventes un ID de 11 caracteres.
 • No incluyas URLs con parámetros de tracking (?utm_, ?si=, ?feature=).
 • Si dudas de una URL, omítela. Es mejor un array pequeño y correcto que uno grande con enlaces rotos.
+• Mínimo: 1 video + 2 artículos de DOMINIOS DISTINTOS.
 
 Responde SOLO con este JSON exacto:
 {"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=XXXXXXXXXXX","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}`
@@ -1372,20 +1466,70 @@ Responde SOLO con este JSON exacto:
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
             body, { headers: { "Content-Type": "application/json" }, timeout: 45000 }
         );
-        const texto = resp.data.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("").trim();
+        const candidate = resp.data.candidates?.[0];
+        const texto = candidate?.content?.parts?.map(p=>p.text||"").join("").trim();
         if (!texto) return null;
-        const data = JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim());
+        let data;
+        try { data = JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim()); }
+        catch { return null; }
 
-        // Verificación paralela HEAD: filtra URLs rotas
-        const todasUrls = [
-            ...(data.videos || []).map(v => v.url).filter(Boolean),
-            ...(data.articulos || []).map(a => a.url).filter(Boolean)
-        ];
-        if (todasUrls.length) {
-            const validas = await verificarUrlsParalelo(todasUrls, 5000);
-            data.videos    = (data.videos || []).filter(v => validas.has(v.url));
-            data.articulos = (data.articulos || []).filter(a => validas.has(a.url));
-            console.log(`✅ Recursos verificados: ${data.videos.length} videos + ${data.articulos.length} artículos (de ${todasUrls.length} propuestos)`);
+        // 1) Filtrar a SOLO URLs presentes en groundingMetadata (citas reales)
+        const urlsConfiables = extraerUrlsDeGroundingMetadata(candidate);
+        if (urlsConfiables.size > 0) {
+            const isCited = (url) => {
+                if (!url) return false;
+                if (urlsConfiables.has(url)) return true;
+                // Match flexible: si la URL tiene un videoId que aparece en algún chunk
+                const vid = extraerVideoIdDeUrl(url);
+                if (vid) {
+                    for (const u of urlsConfiables) {
+                        if (u.includes(vid)) return true;
+                    }
+                }
+                // Match flexible por dominio + path
+                try {
+                    const a = new URL(url);
+                    for (const u of urlsConfiables) {
+                        try {
+                            const b = new URL(u);
+                            if (a.hostname === b.hostname && a.pathname === b.pathname) return true;
+                        } catch {}
+                    }
+                } catch {}
+                return false;
+            };
+            data.videos    = (data.videos || []).filter(v => isCited(v.url));
+            data.articulos = (data.articulos || []).filter(a => isCited(a.url));
+        }
+
+        // 2) Filtrar Wikipedia + verificar oEmbed YouTube + diversidad dominios
+        data = await filtrarYverificarRecursos(data);
+
+        const totalVerificados = (data.videos?.length || 0) + (data.articulos?.length || 0);
+        console.log(`✅ Recursos verificados [intento ${intento}]: ${data.videos?.length || 0} videos + ${data.articulos?.length || 0} artículos (cita-grounded: ${urlsConfiables.size > 0})`);
+
+        // Si quedan < 3 fuentes y es el primer intento, hacer 2do intento más estricto
+        if (totalVerificados < 3 && intento === 1) {
+            const segundoIntento = await buscarRecursosEducativosIA(tema, 2);
+            if (segundoIntento) {
+                // Mezclar resultados
+                const videosMerged = [...(data.videos||[]), ...(segundoIntento.videos||[])];
+                const articulosMerged = [...(data.articulos||[]), ...(segundoIntento.articulos||[])];
+                // Quitar duplicados por URL
+                const seenV = new Set();
+                data.videos = videosMerged.filter(v => { if (seenV.has(v.url)) return false; seenV.add(v.url); return true; });
+                const seenA = new Set();
+                data.articulos = articulosMerged.filter(a => { if (seenA.has(a.url)) return false; seenA.add(a.url); return true; });
+                data.consultas_sugeridas = [...(data.consultas_sugeridas||[]), ...(segundoIntento.consultas_sugeridas||[])].slice(0, 4);
+                // Re-aplicar diversidad final
+                data = await filtrarYverificarRecursos(data);
+            }
+        }
+
+        // Si tras todo siguen siendo pocos recursos, agregar nota de tema con poca documentación
+        const totalFinal = (data.videos?.length || 0) + (data.articulos?.length || 0);
+        if (totalFinal < 2) {
+            data.notaPocaDocumentacion = '⚠️ Tema con documentación pública limitada. Pídele a tu maestro recursos adicionales o consulta libros de texto.';
         }
         return data;
     } catch(e) { console.warn("Búsqueda recursos IA falló:", e.message); return null; }
@@ -1517,7 +1661,7 @@ OTROS CAMPOS:
 • "ejemplosPracticos": 3 objetos {problema, solucion_paso_a_paso}. Problemas REALISTAS (no "Juan tiene 5 manzanas"). Solución en 4-6 pasos numerados, cada paso explicando el porqué del paso, no solo el qué.
 • "quiz": 6 preguntas distribuidas por nivel Bloom: [recordar, comprender, aplicar, analizar, evaluar, crear]. Añade campo "bloom". Los 4 distractores deben ser errores plausibles que un estudiante real cometería (NO absurdos, NO obviamente falsos). Índice "r" basado en 0. Cada pregunta incluye "explicacion": 2-3 frases que (a) por qué la correcta lo es, (b) qué confusión específica evita, (c) qué intuición fortalece.
 • "flashcards": 8 tarjetas. Reverso con: definición precisa (1 línea) + ejemplo concreto y específico + 1 frase de "por qué importa" o "cómo lo usas".
-• "fuentes": 3-5 referencias REALES y verificables del tema (libro/autor, paper clásico, recurso académico mexicano, documental, sitio institucional como UNAM/IPN/CONACYT). NO inventes URLs ni autores.
+• "fuentes": 3-5 referencias REALES y verificables del tema, **DOMINIOS DISTINTOS**, **PROHIBIDO Wikipedia/Wikimedia (en cualquier idioma)**. Solo aceptamos: paper académico (con DOI o autor real verificable), libro con autor + año, sitio institucional (gob.mx/unam.mx/ipn.mx/conacyt.mx/sep.gob.mx), Khan Academy/Coursera/edX/MIT OCW, documental verificable. Si no puedes ofrecer 3 fuentes diversas verificables, ofrece solo 2 e incluye al final como cuarta entrada el texto literal '⚠️ Tema con documentación pública limitada — pide a tu maestro recursos adicionales.' NO inventes URLs ni autores.
 
 FORMATO JSON EXACTO (SOLO JSON):
 {
@@ -1585,6 +1729,16 @@ ${texto.substring(0, 30000)}`
     data.contexto = texto.substring(0, 10000);
     data.quiz = normalizeQuestions(data.quiz || []);
     if (videoId) data.videoId = videoId;
+    // Filtrar Wikipedia de fuentes (regla estricta 2.0.0.5)
+    if (Array.isArray(data.fuentes)) {
+        data.fuentes = data.fuentes.filter(f => {
+            const s = (typeof f === 'string' ? f : (f?.titulo || f?.url || '')).toLowerCase();
+            return !s.includes('wikipedia') && !s.includes('wikimedia');
+        });
+        if (!data.fuentes.length) {
+            data.fuentes = ['⚠️ Tema con documentación pública limitada — pide a tu maestro recursos adicionales.'];
+        }
+    }
     return data;
 }
 
@@ -2091,6 +2245,112 @@ app.get('/api/alumno/perfil', verifyAlumno, async (req, res) => {
             retosActivos,
             logros
         });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ NOTIFICACIONES DEL ALUMNO — feed unificado (tareas, retos, parciales próximos) ══
+app.get('/api/alumno/notificaciones', verifyAlumno, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const alumno = await Alumno.findById(req.alumno.id).select('grupoId nombre').lean();
+        if (!alumno?.grupoId) return res.json({ notificaciones: [] });
+
+        const hace14d = new Date(Date.now() - 14 * 86400000);
+        const ahora   = new Date();
+        const en7d    = new Date(Date.now() + 7 * 86400000);
+
+        // Tareas y retos recientes del grupo
+        const [tareas, retos, planes, examenes] = await Promise.all([
+            Tarea.find({ grupoId: alumno.grupoId, creadoEn: { $gte: hace14d } })
+                .select('titulo shortId creadoEn fechaVencimiento').sort({ creadoEn: -1 }).limit(20).lean(),
+            Reto.find({ grupoId: alumno.grupoId, activo: true, fechaFin: { $gte: ahora } })
+                .select('titulo shortId creadoEn fechaFin').sort({ creadoEn: -1 }).limit(10).lean(),
+            PlanEstudio.find({ grupoId: alumno.grupoId, activo: true,
+                $or: [
+                    { fechasParciales: { $exists: true, $ne: [] } },
+                    { fechaFinal: { $ne: null } }
+                ]
+            }).select('titulo shortId fechasParciales fechaFinal').lean(),
+            Examen.find({ grupoId: alumno.grupoId, activo: true, creadoEn: { $gte: hace14d } })
+                .select('titulo shortId creadoEn').sort({ creadoEn: -1 }).limit(10).lean()
+        ]);
+
+        const notifs = [];
+        for (const t of tareas) {
+            notifs.push({
+                id: 'tarea_' + t._id,
+                tipo: 'tarea_nueva',
+                titulo: t.titulo,
+                shortId: t.shortId,
+                fecha: t.creadoEn,
+                fechaVence: t.fechaVencimiento || null,
+                accion: `?tarea=${t.shortId}`
+            });
+        }
+        for (const r of retos) {
+            const dias = Math.max(0, Math.ceil((new Date(r.fechaFin) - ahora) / 86400000));
+            notifs.push({
+                id: 'reto_' + r._id,
+                tipo: 'reto_nuevo',
+                titulo: r.titulo,
+                shortId: r.shortId,
+                fecha: r.creadoEn,
+                diasRestantes: dias,
+                accion: `?reto=${r.shortId}`
+            });
+        }
+        for (const e of examenes) {
+            notifs.push({
+                id: 'examen_' + e._id,
+                tipo: 'examen_disponible',
+                titulo: e.titulo,
+                shortId: e.shortId,
+                fecha: e.creadoEn,
+                accion: `?examen=${e.shortId}`
+            });
+        }
+        for (const p of planes) {
+            // Próximos parciales en 7 días
+            (p.fechasParciales || []).forEach((fp, i) => {
+                const date = new Date(fp);
+                if (date >= ahora && date <= en7d) {
+                    const dias = Math.ceil((date - ahora) / 86400000);
+                    notifs.push({
+                        id: 'parcial_' + p._id + '_' + i,
+                        tipo: 'parcial_proximo',
+                        titulo: `Parcial ${i+1} — ${p.titulo}`,
+                        shortId: p.shortId,
+                        fecha: fp,
+                        diasRestantes: dias,
+                        accion: `?plan=${p.shortId}`
+                    });
+                }
+            });
+            if (p.fechaFinal) {
+                const fFinal = new Date(p.fechaFinal);
+                if (fFinal >= ahora && fFinal <= en7d) {
+                    const dias = Math.ceil((fFinal - ahora) / 86400000);
+                    notifs.push({
+                        id: 'final_' + p._id,
+                        tipo: 'final_proximo',
+                        titulo: `🏁 Examen FINAL — ${p.titulo}`,
+                        shortId: p.shortId,
+                        fecha: p.fechaFinal,
+                        diasRestantes: dias,
+                        accion: `?plan=${p.shortId}`
+                    });
+                }
+            }
+        }
+        // Ordenar por urgencia: próximos primero, luego por fecha de creación desc
+        notifs.sort((a, b) => {
+            const aDias = a.diasRestantes ?? 999;
+            const bDias = b.diasRestantes ?? 999;
+            if (aDias !== bDias) return aDias - bDias;
+            return new Date(b.fecha) - new Date(a.fecha);
+        });
+
+        res.json({ notificaciones: notifs.slice(0, 30) });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4729,6 +4989,19 @@ const planEstudioSchema = new mongoose.Schema({
     requisitosPrevios: { type: String, default: '' },
     rubricaEvaluacion: { type: String, default: '' },
     tipo:          { type: String, enum: ['plan','parcial','final'], default: 'plan' },
+    // Calendario del periodo
+    fechaInicio:    { type: Date, default: null },
+    fechaFin:       { type: Date, default: null },
+    clasesPorSemana:{ type: Number, default: 3 },
+    totalClases:    { type: Number, default: 0 },
+    numParciales:   { type: Number, default: 2, enum: [1,2,3] },
+    incluirFinal:   { type: Boolean, default: true },
+    fechasParciales:[{ type: Date }],
+    fechaFinal:     { type: Date, default: null },
+    distribucionTareas: [{
+        parcialNum: Number,             // 1, 2, 3 o 99 para final
+        tareaIds:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'Tarea' }]
+    }],
     tareaIds:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'Tarea' }],
     preguntasPorTarea: { type: Number, default: 5 },
     tiempoLimiteMin:   { type: Number, default: 45 },
@@ -4742,7 +5015,9 @@ app.post('/api/maestro/plan-estudio', verifyToken, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { grupoId, tareaIds, titulo, descripcion, preguntasPorTarea, tiempoLimiteMin,
-                objetivos, competencias, requisitosPrevios, rubricaEvaluacion, tipo } = req.body;
+                objetivos, competencias, requisitosPrevios, rubricaEvaluacion, tipo,
+                fechaInicio, fechaFin, clasesPorSemana, numParciales, incluirFinal,
+                distribucionTareas } = req.body;
         if (!tareaIds?.length || tareaIds.length < 2)
             return res.status(400).json({ error: 'Selecciona al menos 2 tareas para el plan.' });
 
@@ -4754,6 +5029,47 @@ app.post('/api/maestro/plan-estudio', verifyToken, async (req, res) => {
         if (tareas.length !== tareaIds.length)
             return res.status(403).json({ error: 'Algunas tareas no te pertenecen.' });
 
+        // ── Calendario auto-calculado ──
+        const fInicio = fechaInicio ? new Date(fechaInicio) : null;
+        const fFin    = fechaFin    ? new Date(fechaFin)    : null;
+        const cps     = parseInt(clasesPorSemana) || 3;
+        const np      = [1,2,3].includes(parseInt(numParciales)) ? parseInt(numParciales) : 2;
+        const incFin  = incluirFinal !== false;
+        let totalClases = 0;
+        let fechasParciales = [];
+        let fechaFinal = null;
+
+        if (fInicio && fFin && fFin > fInicio) {
+            const diasPeriodo = Math.ceil((fFin - fInicio) / 86400000);
+            const semanas = Math.max(1, Math.round(diasPeriodo / 7));
+            totalClases = semanas * cps;
+            // Fechas de parciales distribuidas equitativamente dentro del periodo
+            for (let i = 1; i <= np; i++) {
+                const ratio = i / (np + (incFin ? 1 : 0));
+                const ts = fInicio.getTime() + (fFin.getTime() - fInicio.getTime()) * ratio;
+                fechasParciales.push(new Date(ts));
+            }
+            if (incFin) {
+                // Final: 3 días antes del fin
+                fechaFinal = new Date(fFin.getTime() - 3 * 86400000);
+            }
+        }
+
+        // Distribución automática de tareas si no se proporciona
+        let dist = Array.isArray(distribucionTareas) ? distribucionTareas : [];
+        if (!dist.length && fechasParciales.length) {
+            const totalParciales = np;
+            const tareasPorParcial = Math.ceil(tareaIds.length / totalParciales);
+            for (let p = 1; p <= totalParciales; p++) {
+                const inicio = (p - 1) * tareasPorParcial;
+                const fin    = Math.min(p * tareasPorParcial, tareaIds.length);
+                dist.push({
+                    parcialNum: p,
+                    tareaIds: tareaIds.slice(inicio, fin)
+                });
+            }
+        }
+
         const shortId = await shortIdUnico(PlanEstudio);
         const plan = await PlanEstudio.create({
             shortId, maestroId: req.maestro.id, grupoId,
@@ -4764,14 +5080,62 @@ app.post('/api/maestro/plan-estudio', verifyToken, async (req, res) => {
             requisitosPrevios: requisitosPrevios || '',
             rubricaEvaluacion: rubricaEvaluacion || '',
             tipo: ['plan','parcial','final'].includes(tipo) ? tipo : 'plan',
+            fechaInicio: fInicio, fechaFin: fFin,
+            clasesPorSemana: cps, totalClases,
+            numParciales: np, incluirFinal: incFin,
+            fechasParciales, fechaFinal,
+            distribucionTareas: dist,
             tareaIds, preguntasPorTarea: preguntasPorTarea || 5,
             tiempoLimiteMin: tiempoLimiteMin || 45, activo: true
         });
         res.json({
             shortId: plan.shortId, titulo: plan.titulo,
             totalTareas: tareas.length,
-            tareas: tareas.map(t => t.titulo)
+            tareas: tareas.map(t => t.titulo),
+            calendario: {
+                fechaInicio: plan.fechaInicio,
+                fechaFin: plan.fechaFin,
+                totalClases: plan.totalClases,
+                fechasParciales: plan.fechasParciales,
+                fechaFinal: plan.fechaFinal
+            }
         });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Preview del calendario del plan (sin crear)
+app.post('/api/maestro/plan-estudio/preview', verifyToken, async (req, res) => {
+    try {
+        const { fechaInicio, fechaFin, clasesPorSemana, numParciales, incluirFinal, tareaIds = [] } = req.body;
+        const fInicio = fechaInicio ? new Date(fechaInicio) : null;
+        const fFin    = fechaFin    ? new Date(fechaFin)    : null;
+        const cps     = parseInt(clasesPorSemana) || 3;
+        const np      = [1,2,3].includes(parseInt(numParciales)) ? parseInt(numParciales) : 2;
+        const incFin  = incluirFinal !== false;
+        if (!fInicio || !fFin || fFin <= fInicio) {
+            return res.json({ ok:false, error: 'Define fechas válidas (fin debe ser después de inicio).' });
+        }
+        const diasPeriodo = Math.ceil((fFin - fInicio) / 86400000);
+        const semanas = Math.max(1, Math.round(diasPeriodo / 7));
+        const totalClases = semanas * cps;
+        const fechasParciales = [];
+        for (let i = 1; i <= np; i++) {
+            const ratio = i / (np + (incFin ? 1 : 0));
+            const ts = fInicio.getTime() + (fFin.getTime() - fInicio.getTime()) * ratio;
+            fechasParciales.push(new Date(ts));
+        }
+        const fechaFinal = incFin ? new Date(fFin.getTime() - 3 * 86400000) : null;
+        // Distribución automática de tareas seleccionadas
+        const distribucion = [];
+        if (tareaIds.length) {
+            const tareasPorParcial = Math.ceil(tareaIds.length / np);
+            for (let p = 1; p <= np; p++) {
+                const inicio = (p - 1) * tareasPorParcial;
+                const fin    = Math.min(p * tareasPorParcial, tareaIds.length);
+                distribucion.push({ parcialNum: p, tareaIds: tareaIds.slice(inicio, fin) });
+            }
+        }
+        res.json({ ok:true, semanas, totalClases, fechasParciales, fechaFinal, distribucion });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4804,7 +5168,10 @@ app.post('/api/maestro/examen-parcial', verifyToken, upload.array('archivos', 6)
         const lecciones       = asArr(req.body.lecciones);
         const urls            = asArr(req.body.urls);
         const textosExtra     = asArr(req.body.textosExtra);
-        const numPreguntas    = parseInt(req.body.numPreguntas) || 20;
+        const tipo            = (req.body.tipo === 'final') ? 'final' : 'parcial';
+        let   numPreguntas    = parseInt(req.body.numPreguntas) || 20;
+        // Si es final, fuerza mínimo 30 preguntas
+        if (tipo === 'final' && numPreguntas < 30) numPreguntas = 30;
         const tiempoLimiteMin = parseInt(req.body.tiempoLimiteMin) || 60;
 
         const grupo = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id });
@@ -4889,22 +5256,34 @@ app.post('/api/maestro/examen-parcial', verifyToken, upload.array('archivos', 6)
 
         // 2. Pedir a la IA que sintetice un examen NUEVO (no muestra de pools viejos)
         const N = Math.max(5, Math.min(50, Number(numPreguntas) || 20));
-        const sistema = `Eres un profesor universitario mexicano de élite especializado en evaluación auténtica. Generas exámenes parciales de altísima calidad que sintetizan información de MÚLTIPLES fuentes simultáneamente. Las preguntas no son de memorización plana sino que exigen integrar conceptos entre fuentes. Distractores plausibles que reflejen errores reales de aula. Respondes ÚNICAMENTE con JSON válido.`;
+        const esFinal = tipo === 'final';
+        const sistema = `Eres un profesor universitario mexicano de élite especializado en evaluación auténtica. Generas exámenes ${esFinal ? 'FINALES de periodo' : 'parciales'} de altísima calidad que sintetizan información de MÚLTIPLES fuentes simultáneamente. Las preguntas no son de memorización plana sino que exigen integrar conceptos entre fuentes. Distractores plausibles que reflejen errores reales de aula. Respondes ÚNICAMENTE con JSON válido.`;
 
-        const usuario = `Genera un examen parcial para alumnos de "${grupo.materia} — ${grupo.semestre}" con EXACTAMENTE ${N} preguntas integradoras a partir del material acumulado abajo (${fuentesUsadas.length} fuentes).
+        const distribucionBloom = esFinal
+            ? '15% recordar/comprender, 35% aplicar/analizar, 50% evaluar/crear (es FINAL: profundidad alta)'
+            : '20% recordar/comprender, 40% aplicar/analizar, 40% evaluar/crear';
+
+        const intro = esFinal
+            ? `Este es el EXAMEN FINAL del periodo: integra TODOS los temas, mayor profundidad, preguntas que exigen sintetizar el curso completo.`
+            : `Examen PARCIAL: integra el material proporcionado.`;
+
+        const usuario = `Genera un examen ${esFinal ? 'FINAL del periodo' : 'parcial'} para alumnos de "${grupo.materia} — ${grupo.semestre}" con EXACTAMENTE ${N} preguntas integradoras a partir del material acumulado abajo (${fuentesUsadas.length} fuentes).
+
+${intro}
 
 REGLAS DE CALIDAD:
 - Las preguntas DEBEN integrar contenido de varias fuentes — no preguntar solo sobre una.
-- Distribución Bloom recomendada: ~20% recordar/comprender, ~40% aplicar/analizar, ~40% evaluar/crear (a menos que se indique otra).
+- Distribución Bloom: ${distribucionBloom}.
 - 4 opciones por pregunta, 3 distractores plausibles (errores reales de estudiante), longitud similar (±20%).
 - NO uses "ninguna/todas las anteriores".
 - Cada pregunta DEBE incluir "explicacion" didáctica de 2-3 frases.
 - Cada pregunta debe llevar un campo "fuente" indicando qué tema/fuente cubre.
 - NO inventes datos específicos no presentes en el material; si los necesitas, cuéntalos como "según el material".
+${esFinal ? '- Como es final, incluye 2-3 preguntas tipo "ensayo corto" donde se pide aplicar un concepto a un escenario real (siguen siendo opción múltiple, pero con escenario más rico).' : ''}
 
 FORMATO JSON:
 {
-  "titulo": "Examen parcial: [tema integrador]",
+  "titulo": "${esFinal ? 'Examen FINAL' : 'Examen parcial'}: [tema integrador]",
   "preguntas": [
     {"p":"...","o":["A","B","C","D"],"r":0,"bloom":"aplicar","explicacion":"...","fuente":"Tarea: ..."}
   ]
@@ -4932,13 +5311,14 @@ ${contextoCombinado.substring(0, 38000)}`;
             return res.status(502).json({ error: `La IA solo devolvió ${preguntas.length} preguntas válidas. Reintenta o agrega más fuentes.` });
         }
 
+        const tipoLabel = (tipo === 'final') ? 'FINAL' : 'parcial';
         const shortId = await shortIdUnico(Examen);
         const examen = await Examen.create({
             shortId,
             maestroId: req.maestro.id,
             grupoId,
-            titulo: titulo || data.titulo || `Examen parcial — ${grupo.nombre}`,
-            instrucciones: instrucciones || `Examen parcial sintetizado desde ${fuentesUsadas.length} fuente(s). Tienes ${tiempoLimiteMin} minutos.`,
+            titulo: titulo || data.titulo || `Examen ${tipoLabel} — ${grupo.nombre}`,
+            instrucciones: instrucciones || `Examen ${tipoLabel} sintetizado desde ${fuentesUsadas.length} fuente(s). Tienes ${tiempoLimiteMin} minutos.`,
             preguntas, tiempoLimite: tiempoLimiteMin, activo: true
         });
 
