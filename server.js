@@ -1341,7 +1341,7 @@ async function extraerTextoWeb(url) {
 
 // ── Verificación paralela de URLs educativas finales.
 // HEAD es rápido, pero algunas instituciones lo bloquean; por eso hay GET ligero como respaldo.
-async function verificarUrlEducativa(url, timeoutMs = 6500) {
+async function verificarUrlEducativa(url, timeoutMs = 4500) {
     const limpia = limpiarTrackingUrl(url);
     if (!esUrlEducativaFinal(limpia)) return { originalUrl: limpia, url: limpia, ok: false, motivo: 'no-educativa-final' };
 
@@ -1382,7 +1382,7 @@ async function verificarUrlEducativa(url, timeoutMs = 6500) {
     return { originalUrl: limpia, url: limpia, ok: false, motivo: 'inaccesible' };
 }
 
-async function verificarUrlsEducativasParalelo(urls, timeoutMs = 6500) {
+async function verificarUrlsEducativasParalelo(urls, timeoutMs = 4500) {
     const resultados = await Promise.all(urls.map(u => verificarUrlEducativa(u, timeoutMs)));
     const validas = new Map();
     resultados.filter(r => r.ok).forEach(r => {
@@ -1399,7 +1399,7 @@ async function verificarYouTube(videoId) {
     try {
         const r = await axios.get(
             `https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v=${videoId}`,
-            { timeout: 6000, validateStatus: () => true }
+            { timeout: 4500, validateStatus: () => true }
         );
         if (r.status === 200 && r.data?.title) {
             return { ok: true, titulo: r.data.title, autor: r.data.author_name, thumbnail: r.data.thumbnail_url };
@@ -1454,7 +1454,7 @@ async function filtrarYverificarRecursos(data) {
 
     // 3) Verificar artículos/PDFs por red y conservar solo URLs finales institucionales/PDF.
     if (data.articulos.length) {
-        const validas = await verificarUrlsEducativasParalelo(data.articulos.map(a => a.url), 6500);
+        const validas = await verificarUrlsEducativasParalelo(data.articulos.map(a => a.url), 4500);
         data.articulos = data.articulos.map(a => {
             const check = validas.get(limpiarTrackingUrl(a.url));
             return check ? { ...a, url: check.url, tipo: check.tipo === 'PDF' ? 'PDF' : 'Artículo', urlActiva: true } : null;
@@ -1522,9 +1522,7 @@ async function buscarRecursosEducativosIA(tema, intento = 1) {
         if (cached) { console.log(`⚡ Cache hit [recursos]: ${tema}`); return cached; }
     }
     try {
-        const queryHint = intento === 1
-            ? `Busca recursos educativos REALES, finales y actuales en español mexicano sobre: "${tema}"`
-            : `2do intento - busca SOLO PDFs o instituciones: (site:gob.mx OR site:unam.mx OR site:ipn.mx OR site:sep.gob.mx OR site:conacyt.mx OR site:conahcyt.mx OR site:uam.mx OR site:colmex.mx OR site:scielo.org.mx OR site:redalyc.org) "${tema}" filetype:pdf`;
+        const queryHint = `Busca recursos educativos REALES, finales y actuales en español mexicano sobre: "${tema}"`;
 
         const body = {
             contents: [{ role: "user", parts: [{ text:
@@ -1555,7 +1553,7 @@ Responde SOLO con este JSON exacto:
         };
         const resp = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-            body, { headers: { "Content-Type": "application/json" }, timeout: 35000 }
+            body, { headers: { "Content-Type": "application/json" }, timeout: 25000 }
         );
         const candidate = resp.data.candidates?.[0];
         const texto = candidate?.content?.parts?.map(p=>p.text||"").join("").trim();
@@ -1598,24 +1596,6 @@ Responde SOLO con este JSON exacto:
 
         const totalVerificados = (data.videos?.length || 0) + (data.articulos?.length || 0);
         console.log(`✅ Recursos verificados [intento ${intento}]: ${data.videos?.length || 0} videos + ${data.articulos?.length || 0} artículos (cita-grounded: ${urlsConfiables.size > 0})`);
-
-        // Segundo intento solo si no quedó nada: evita esperas largas y relleno de baja calidad.
-        if (totalVerificados === 0 && intento === 1) {
-            const segundoIntento = await buscarRecursosEducativosIA(tema, 2);
-            if (segundoIntento) {
-                // Mezclar resultados
-                const videosMerged = [...(data.videos||[]), ...(segundoIntento.videos||[])];
-                const articulosMerged = [...(data.articulos||[]), ...(segundoIntento.articulos||[])];
-                // Quitar duplicados por URL
-                const seenV = new Set();
-                data.videos = videosMerged.filter(v => { if (seenV.has(v.url)) return false; seenV.add(v.url); return true; });
-                const seenA = new Set();
-                data.articulos = articulosMerged.filter(a => { if (seenA.has(a.url)) return false; seenA.add(a.url); return true; });
-                data.consultas_sugeridas = [...(data.consultas_sugeridas||[]), ...(segundoIntento.consultas_sugeridas||[])].slice(0, 4);
-                // Re-aplicar diversidad final
-                data = await filtrarYverificarRecursos(data);
-            }
-        }
 
         // Si tras todo siguen siendo pocos recursos, agregar nota de tema con poca documentación
         const totalFinal = (data.videos?.length || 0) + (data.articulos?.length || 0);
