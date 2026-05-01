@@ -10,6 +10,15 @@ import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import {
+    limpiarTrackingUrl,
+    esYoutubeVideoUrl,
+    extraerYoutubeId as extraerYoutubeIdSeguro,
+    esFuenteProhibida as esFuenteProhibidaSegura,
+    esUrlEducativaFinal,
+    tipoArticuloEducativo,
+    dominioBase
+} from './resourceQuality.js';
 
 dotenv.config();
 
@@ -1112,11 +1121,10 @@ const upload = multer({ dest: '/tmp/', limits: { fileSize: 10 * 1024 * 1024 } })
 // ══════════════════════════════════════════════════════════════
 
 function esYoutube(url) {
-    return /(?:youtube\.com\/(?:watch|shorts|embed|live)|youtu\.be\/)/.test(url);
+    return esYoutubeVideoUrl(url);
 }
 function extraerYoutubeId(url) {
-    const m = url.match(/(?:[?&]v=|youtu\.be\/|\/embed\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})/);
-    return m ? m[1] : null;
+    return extraerYoutubeIdSeguro(url);
 }
 
 // ── Gemini con Google Search + url_context — lee CUALQUIER URL en tiempo real
@@ -1127,7 +1135,7 @@ async function extraerConGeminiGrounding(url) {
 
     const prompt = esVideo
         ? `Estás analizando este video de YouTube: ${url}\n\nTRANSCRIBE Y EXPANDE el contenido educativo completo del video con máximo detalle:\n• Todos los conceptos, definiciones y explicaciones que se dan.\n• Ejemplos concretos mencionados (datos, fechas, personajes, casos).\n• Conclusiones y puntos clave.\n• Si el video tiene capítulos o secciones, identifícalos.\n\nSi por alguna razón no puedes acceder al video directamente, busca información detallada sobre el tema del video usando el título y descripción como pista, e identifica qué tema enseña el video.\n\nDevuelve TODO el contenido textual sin resumir, listo para usarse como fuente de una clase educativa.`
-        : `Accede y extrae el contenido educativo completo de esta URL: ${url}\n\nSi el sitio requiere suscripción o está bloqueado, busca el mismo contenido en fuentes libres (Wikipedia, Khan Academy, artículos académicos gratuitos) y proporciona información equivalente de alta calidad.\nExtrae: títulos, definiciones, explicaciones, ejemplos, datos importantes, fórmulas si aplica.\nDevuelve SOLO el contenido educativo, sin navegación ni publicidad. Mínimo 1500 caracteres.`;
+        : `Accede y extrae el contenido educativo completo de esta URL: ${url}\n\nSi el sitio requiere suscripción o está bloqueado, busca el mismo tema en fuentes institucionales, PDFs académicos gratuitos, repositorios universitarios o sitios oficiales. NO uses Wikipedia, Wikimedia, Khan Academy, Google Scholar como buscador, ni páginas de resultados.\nExtrae: títulos, definiciones, explicaciones, ejemplos, datos importantes, fórmulas si aplica.\nDevuelve SOLO el contenido educativo, sin navegación ni publicidad. Mínimo 1500 caracteres.`;
 
     // Construir parts: si es video, agregamos fileData con la URL de YouTube (Gemini lo entiende nativamente)
     const parts = [{ text: prompt }];
@@ -1328,19 +1336,60 @@ async function extraerTextoWeb(url) {
         }
     } catch {}
 
-    throw new Error(`No se pudo leer: ${url}\n\n💡 Opciones:\n• Pega el texto directamente\n• Usa Wikipedia, Khan Academy o YouTube del mismo tema\n• Si es PDF, súbelo en "Foto/PDF"`);
+    throw new Error(`No se pudo leer: ${url}\n\n💡 Opciones:\n• Pega el texto directamente\n• Usa un PDF institucional o una página oficial del mismo tema\n• Si es PDF, súbelo en "Foto/PDF"`);
 }
 
-// ── Verificación paralela de URLs por HEAD (filtra las que devuelven ≥400 o timeout)
-async function verificarUrlsParalelo(urls, timeoutMs = 5000) {
-    const pruebas = urls.map(u => axios.head(u, {
-        timeout: timeoutMs,
-        maxRedirects: 3,
-        validateStatus: s => s < 400
-    }).then(() => ({ url: u, ok: true }))
-      .catch(() => ({ url: u, ok: false })));
-    const resultados = await Promise.all(pruebas);
-    return new Set(resultados.filter(r => r.ok).map(r => r.url));
+// ── Verificación paralela de URLs educativas finales.
+// HEAD es rápido, pero algunas instituciones lo bloquean; por eso hay GET ligero como respaldo.
+async function verificarUrlEducativa(url, timeoutMs = 6500) {
+    const limpia = limpiarTrackingUrl(url);
+    if (!esUrlEducativaFinal(limpia)) return { originalUrl: limpia, url: limpia, ok: false, motivo: 'no-educativa-final' };
+
+    const headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8"
+    };
+
+    try {
+        const head = await axios.head(limpia, {
+            timeout: timeoutMs,
+            maxRedirects: 4,
+            headers,
+            validateStatus: s => s < 400
+        });
+        const finalUrl = limpiarTrackingUrl(head.request?.res?.responseUrl || limpia);
+        const contentType = head.headers?.["content-type"] || '';
+        if (esUrlEducativaFinal(finalUrl, contentType)) {
+            return { originalUrl: limpia, url: finalUrl, ok: true, tipo: tipoArticuloEducativo(finalUrl, contentType), contentType };
+        }
+    } catch {}
+
+    try {
+        const get = await axios.get(limpia, {
+            timeout: timeoutMs,
+            maxRedirects: 4,
+            headers: { ...headers, Range: "bytes=0-4096" },
+            responseType: "arraybuffer",
+            validateStatus: s => s < 400
+        });
+        const finalUrl = limpiarTrackingUrl(get.request?.res?.responseUrl || limpia);
+        const contentType = get.headers?.["content-type"] || '';
+        if (esUrlEducativaFinal(finalUrl, contentType)) {
+            return { originalUrl: limpia, url: finalUrl, ok: true, tipo: tipoArticuloEducativo(finalUrl, contentType), contentType };
+        }
+    } catch {}
+
+    return { originalUrl: limpia, url: limpia, ok: false, motivo: 'inaccesible' };
+}
+
+async function verificarUrlsEducativasParalelo(urls, timeoutMs = 6500) {
+    const resultados = await Promise.all(urls.map(u => verificarUrlEducativa(u, timeoutMs)));
+    const validas = new Map();
+    resultados.filter(r => r.ok).forEach(r => {
+        validas.set(limpiarTrackingUrl(r.originalUrl), r);
+        validas.set(limpiarTrackingUrl(r.url), r);
+    });
+    return validas;
 }
 
 // ── Verificación robusta de YouTube por oEmbed (HEAD a youtube.com siempre devuelve 200,
@@ -1359,11 +1408,9 @@ async function verificarYouTube(videoId) {
     } catch { return { ok: false, motivo: 'timeout' }; }
 }
 
-// Filtra y excluye Wikipedia/Wikimedia
+// Filtra y excluye buscadores/fuentes no finales.
 function esFuenteProhibida(url) {
-    if (!url) return true;
-    const u = url.toLowerCase();
-    return u.includes('wikipedia.org') || u.includes('wikimedia.org') || u.includes('wikiwand.com');
+    return esFuenteProhibidaSegura(url);
 }
 
 // Extrae el videoId de un URL de YouTube (si aplica)
@@ -1372,12 +1419,16 @@ function extraerVideoIdDeUrl(url) {
     return extraerYoutubeId(url);
 }
 
-// Verificación batch: solo mantiene videos verificados por oEmbed + URLs no-Wikipedia accesibles
+// Verificación batch: solo mantiene videos verificados por oEmbed + URLs educativas finales accesibles.
 async function filtrarYverificarRecursos(data) {
     if (!data) return data;
-    // 1) Bloquear Wikipedia
-    data.videos    = (data.videos    || []).filter(v => !esFuenteProhibida(v.url));
-    data.articulos = (data.articulos || []).filter(a => !esFuenteProhibida(a.url));
+    // 1) Normalizar y bloquear buscadores/fuentes no finales.
+    data.videos = (data.videos || [])
+        .map(v => ({ ...v, url: limpiarTrackingUrl(v.url || '') }))
+        .filter(v => !esFuenteProhibida(v.url) && esYoutubeVideoUrl(v.url));
+    data.articulos = (data.articulos || [])
+        .map(a => ({ ...a, url: limpiarTrackingUrl(a.url || '') }))
+        .filter(a => !esFuenteProhibida(a.url) && esUrlEducativaFinal(a.url));
 
     // 2) Verificar YouTube por oEmbed en paralelo
     const videoChecks = await Promise.all(
@@ -1385,26 +1436,38 @@ async function filtrarYverificarRecursos(data) {
             const id = extraerVideoIdDeUrl(v.url);
             if (!id) return null;
             const check = await verificarYouTube(id);
-            return check.ok ? { ...v, tituloReal: check.titulo, autorReal: check.autor, videoId: id } : null;
+            return check.ok ? {
+                ...v,
+                url: `https://www.youtube.com/watch?v=${id}`,
+                titulo: v.titulo || check.titulo,
+                tituloReal: check.titulo,
+                autorReal: check.autor,
+                canal: v.canal || check.autor || 'YouTube',
+                videoId: id,
+                thumbnail: check.thumbnail,
+                urlActiva: true,
+                reproducirEnTutor: false
+            } : null;
         })
     );
     data.videos = videoChecks.filter(Boolean);
 
-    // 3) Verificar artículos por HEAD (más permisivo)
+    // 3) Verificar artículos/PDFs por red y conservar solo URLs finales institucionales/PDF.
     if (data.articulos.length) {
-        const validas = await verificarUrlsParalelo(data.articulos.map(a => a.url), 5000);
-        data.articulos = data.articulos.filter(a => validas.has(a.url));
+        const validas = await verificarUrlsEducativasParalelo(data.articulos.map(a => a.url), 6500);
+        data.articulos = data.articulos.map(a => {
+            const check = validas.get(limpiarTrackingUrl(a.url));
+            return check ? { ...a, url: check.url, tipo: check.tipo === 'PDF' ? 'PDF' : 'Artículo', urlActiva: true } : null;
+        }).filter(Boolean);
     }
 
     // 4) Diversidad de dominios en artículos (máx 1 por dominio)
     const dominiosVistos = new Set();
     data.articulos = data.articulos.filter(a => {
-        try {
-            const d = new URL(a.url).hostname.replace(/^www\./, '');
-            if (dominiosVistos.has(d)) return false;
-            dominiosVistos.add(d);
-            return true;
-        } catch { return false; }
+        const d = dominioBase(a.url);
+        if (!d || dominiosVistos.has(d)) return false;
+        dominiosVistos.add(d);
+        return true;
     });
     return data;
 }
@@ -1432,39 +1495,67 @@ function extraerUrlsDeGroundingMetadata(candidate) {
 }
 
 // ── Búsqueda de recursos educativos con Gemini Grounding REAL + verificación oEmbed
+const recursosCache = new Map();
+const RECURSOS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+function recursosCacheKey(tema) {
+    return String(tema || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+}
+function cloneJSON(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+function recursosCacheGet(key) {
+    const hit = recursosCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.exp) { recursosCache.delete(key); return null; }
+    return cloneJSON(hit.value);
+}
+function recursosCacheSet(key, value) {
+    recursosCache.set(key, { value: cloneJSON(value), exp: Date.now() + RECURSOS_CACHE_TTL_MS });
+    if (recursosCache.size > 250) recursosCache.delete(recursosCache.keys().next().value);
+}
+
 async function buscarRecursosEducativosIA(tema, intento = 1) {
     if (!GEMINI_KEY) return null;
+    const cacheKey = intento === 1 ? recursosCacheKey(tema) : null;
+    if (cacheKey) {
+        const cached = recursosCacheGet(cacheKey);
+        if (cached) { console.log(`⚡ Cache hit [recursos]: ${tema}`); return cached; }
+    }
     try {
         const queryHint = intento === 1
-            ? `Busca recursos educativos REALES y actuales en español mexicano sobre: "${tema}"`
-            : `2do intento - busca SOLO en estos sitios institucionales: site:khanacademy.org OR site:gob.mx OR site:unam.mx OR site:ipn.mx OR site:conacyt.mx OR site:sep.gob.mx OR site:ted.com — sobre el tema: "${tema}"`;
+            ? `Busca recursos educativos REALES, finales y actuales en español mexicano sobre: "${tema}"`
+            : `2do intento - busca SOLO PDFs o instituciones: (site:gob.mx OR site:unam.mx OR site:ipn.mx OR site:sep.gob.mx OR site:conacyt.mx OR site:conahcyt.mx OR site:uam.mx OR site:colmex.mx OR site:scielo.org.mx OR site:redalyc.org) "${tema}" filetype:pdf`;
 
         const body = {
             contents: [{ role: "user", parts: [{ text:
 `${queryHint}
 
 FUENTES OBLIGATORIAS (usa google_search):
-1. Videos de YouTube de canales educativos institucionales VERIFICABLES (Khan Academy en español, UNAM, IPN, TED-Ed en español, Crash Course en español, Math2Me, DW Documental, BBC Mundo, Veritasium en español, Kurzgesagt en español, QuantumFracture, Date un Vlog, Derivando).
-2. Artículos de fuentes ACADÉMICAS o INSTITUCIONALES (gob.mx, unam.mx, ipn.mx, conacyt.mx, sep.gob.mx, khanacademy.org, britannica.com, nationalgeographic.com, scholar.google.com, jstor.org, springer.com).
-3. PDFs académicos gratuitos si existen.
+1. PDFs académicos gratuitos o guías oficiales, preferentemente de gob.mx, sep.gob.mx, unam.mx, ipn.mx, conacyt.mx/conahcyt.mx, uam.mx, colmex.mx, scielo.org.mx, redalyc.org o repositorios universitarios.
+2. Artículos finales de instituciones, universidades, organismos públicos o repositorios académicos. Deben ser páginas finales, no buscadores.
+3. Videos de YouTube solo si son URLs finales de video de canales educativos o institucionales verificables (UNAM, IPN, SEP, TED-Ed en español, Math2Me, DW Documental, BBC Mundo, Veritasium en español, QuantumFracture, Derivando).
 
 REGLAS ABSOLUTAS:
 • PROHIBIDO Wikipedia y Wikimedia (en cualquier idioma). NO los incluyas.
+• PROHIBIDO Khan Academy: no incluyas khanacademy.org ni enlaces de búsqueda de Khan.
+• PROHIBIDO Google/Google Académico como fuente final: no incluyas google.com, scholar.google.com ni páginas de resultados.
+• PROHIBIDO YouTube Results/Search. Un video debe ser https://www.youtube.com/watch?v=ID o https://youtu.be/ID.
 • PROHIBIDO inventar URLs. Solo devuelve URLs que vengan DIRECTAMENTE de resultados de google_search.
 • Los IDs de YouTube deben ser exactamente los de los resultados de búsqueda — nunca inventes un ID de 11 caracteres.
 • No incluyas URLs con parámetros de tracking (?utm_, ?si=, ?feature=).
 • Si dudas de una URL, omítela. Es mejor un array pequeño y correcto que uno grande con enlaces rotos.
-• Mínimo: 1 video + 2 artículos de DOMINIOS DISTINTOS.
+• Si no encuentras fuentes finales buenas, devuelve arrays vacíos. NO rellenes con Wikipedia, Khan, Google Scholar ni buscadores.
+• Devuelve máximo 2 videos y máximo 4 artículos/PDFs.
 
 Responde SOLO con este JSON exacto:
 {"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=XXXXXXXXXXX","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}`
             }] }],
             tools: [{ google_search: {} }],
-            generationConfig: { temperature: 0.15, maxOutputTokens: 2048, responseMimeType: "application/json" }
+            generationConfig: { temperature: 0.05, maxOutputTokens: 2048, responseMimeType: "application/json" }
         };
         const resp = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-            body, { headers: { "Content-Type": "application/json" }, timeout: 45000 }
+            body, { headers: { "Content-Type": "application/json" }, timeout: 35000 }
         );
         const candidate = resp.data.candidates?.[0];
         const texto = candidate?.content?.parts?.map(p=>p.text||"").join("").trim();
@@ -1502,14 +1593,14 @@ Responde SOLO con este JSON exacto:
             data.articulos = (data.articulos || []).filter(a => isCited(a.url));
         }
 
-        // 2) Filtrar Wikipedia + verificar oEmbed YouTube + diversidad dominios
+        // 2) Filtrar fuentes prohibidas + verificar oEmbed YouTube + diversidad dominios
         data = await filtrarYverificarRecursos(data);
 
         const totalVerificados = (data.videos?.length || 0) + (data.articulos?.length || 0);
         console.log(`✅ Recursos verificados [intento ${intento}]: ${data.videos?.length || 0} videos + ${data.articulos?.length || 0} artículos (cita-grounded: ${urlsConfiables.size > 0})`);
 
-        // Si quedan < 3 fuentes y es el primer intento, hacer 2do intento más estricto
-        if (totalVerificados < 3 && intento === 1) {
+        // Segundo intento solo si no quedó nada: evita esperas largas y relleno de baja calidad.
+        if (totalVerificados === 0 && intento === 1) {
             const segundoIntento = await buscarRecursosEducativosIA(tema, 2);
             if (segundoIntento) {
                 // Mezclar resultados
@@ -1531,6 +1622,7 @@ Responde SOLO con este JSON exacto:
         if (totalFinal < 2) {
             data.notaPocaDocumentacion = '⚠️ Tema con documentación pública limitada. Pídele a tu maestro recursos adicionales o consulta libros de texto.';
         }
+        if (cacheKey) recursosCacheSet(cacheKey, data);
         return data;
     } catch(e) { console.warn("Búsqueda recursos IA falló:", e.message); return null; }
 }
@@ -1557,7 +1649,7 @@ Debes obtener de las búsquedas:
 - Conceptos clave del tema con ejemplos reales
 - Datos históricos/científicos/sociales relevantes con cifras verificables
 - Al menos 4 sub-temas importantes
-- 2-4 fuentes confiables reales (Wikipedia, Khan Academy, UNAM, gob.mx, National Geographic, etc.)
+- 2-4 fuentes confiables reales: PDFs académicos, universidades, instituciones públicas, repositorios o libros verificables. NO uses Wikipedia, Wikimedia, Khan Academy, Google Scholar como buscador ni páginas de resultados.
 
 Con esa información, crea una CLASE MAGISTRAL EXPANSIVA para preparatoria mexicana (14-18 años).
 
@@ -1661,7 +1753,7 @@ OTROS CAMPOS:
 • "ejemplosPracticos": 3 objetos {problema, solucion_paso_a_paso}. Problemas REALISTAS (no "Juan tiene 5 manzanas"). Solución en 4-6 pasos numerados, cada paso explicando el porqué del paso, no solo el qué.
 • "quiz": 6 preguntas distribuidas por nivel Bloom: [recordar, comprender, aplicar, analizar, evaluar, crear]. Añade campo "bloom". Los 4 distractores deben ser errores plausibles que un estudiante real cometería (NO absurdos, NO obviamente falsos). Índice "r" basado en 0. Cada pregunta incluye "explicacion": 2-3 frases que (a) por qué la correcta lo es, (b) qué confusión específica evita, (c) qué intuición fortalece.
 • "flashcards": 8 tarjetas. Reverso con: definición precisa (1 línea) + ejemplo concreto y específico + 1 frase de "por qué importa" o "cómo lo usas".
-• "fuentes": 3-5 referencias REALES y verificables del tema, **DOMINIOS DISTINTOS**, **PROHIBIDO Wikipedia/Wikimedia (en cualquier idioma)**. Solo aceptamos: paper académico (con DOI o autor real verificable), libro con autor + año, sitio institucional (gob.mx/unam.mx/ipn.mx/conacyt.mx/sep.gob.mx), Khan Academy/Coursera/edX/MIT OCW, documental verificable. Si no puedes ofrecer 3 fuentes diversas verificables, ofrece solo 2 e incluye al final como cuarta entrada el texto literal '⚠️ Tema con documentación pública limitada — pide a tu maestro recursos adicionales.' NO inventes URLs ni autores.
+• "fuentes": 3-5 referencias REALES y verificables del tema, **DOMINIOS DISTINTOS**, **PROHIBIDO Wikipedia/Wikimedia/Khan Academy/Google Scholar como fuente final**. Solo aceptamos: paper académico (con DOI o autor real verificable), libro con autor + año, PDF académico, sitio institucional (gob.mx/unam.mx/ipn.mx/conacyt.mx/conahcyt.mx/sep.gob.mx), repositorio universitario, Coursera/edX/MIT OCW o documental verificable. Si no puedes ofrecer 3 fuentes diversas verificables, ofrece solo 2 e incluye al final como cuarta entrada el texto literal '⚠️ Tema con documentación pública limitada — pide a tu maestro recursos adicionales.' NO inventes URLs ni autores.
 
 FORMATO JSON EXACTO (SOLO JSON):
 {
@@ -1729,11 +1821,14 @@ ${texto.substring(0, 30000)}`
     data.contexto = texto.substring(0, 10000);
     data.quiz = normalizeQuestions(data.quiz || []);
     if (videoId) data.videoId = videoId;
-    // Filtrar Wikipedia de fuentes (regla estricta 2.0.0.5)
+    // Filtrar fuentes no aceptadas (regla estricta 2.0.0.5)
     if (Array.isArray(data.fuentes)) {
         data.fuentes = data.fuentes.filter(f => {
             const s = (typeof f === 'string' ? f : (f?.titulo || f?.url || '')).toLowerCase();
-            return !s.includes('wikipedia') && !s.includes('wikimedia');
+            return !s.includes('wikipedia') && !s.includes('wikimedia') &&
+                   !s.includes('khanacademy') && !s.includes('khan academy') &&
+                   !s.includes('scholar.google') && !s.includes('google académico') &&
+                   !s.includes('google academico');
         });
         if (!data.fuentes.length) {
             data.fuentes = ['⚠️ Tema con documentación pública limitada — pide a tu maestro recursos adicionales.'];
@@ -2458,7 +2553,7 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
 
                 (recursos.articulos || []).forEach(a => {
                     paraTarea.push({
-                        titulo: a.titulo, fuente: a.fuente, tipo: 'Artículo',
+                        titulo: a.titulo, fuente: a.fuente, tipo: a.tipo || 'Artículo',
                         nivel: 'Preparatoria', descripcion: a.descripcion,
                         url: a.url, idioma: 'Español', procesable: true,
                         esVideo: false, urlActiva: true
@@ -2471,7 +2566,8 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
                         tipo: 'Video', nivel: 'Preparatoria',
                         descripcion: `${v.descripcion}${v.duracion ? ' · ' + v.duracion : ''}`,
                         url: v.url, idioma: 'Español', procesable: false,
-                        esVideo: true, urlActiva: true
+                        esVideo: true, urlActiva: true, videoId: v.videoId,
+                        thumbnail: v.thumbnail, reproducirEnTutor: false
                     });
                 });
 
@@ -2486,29 +2582,20 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
             }
         }
 
-        // Fallback: generación sin búsqueda (modo antiguo mejorado)
-        const text = await iaCall([
-            { role: 'system', content: 'Eres un experto en recursos educativos. Respondes ÚNICAMENTE con JSON válido.' },
-            { role: 'user', content:
-`Recursos educativos de ALTA CALIDAD para preparatoria en México sobre: "${tema}".
-
-URLs SEGURAS solamente:
-- Wikipedia: https://es.wikipedia.org/wiki/${encodeURIComponent(tema.replace(/ /g,'_'))}
-- Khan Academy: https://es.khanacademy.org/search?page_search_query=${encodeURIComponent(tema)}
-- YouTube búsqueda: https://www.youtube.com/results?search_query=${encodeURIComponent(tema + ' educativo español')}
-- Google Académico: https://scholar.google.com/scholar?q=${encodeURIComponent(tema)}
-
-Responde JSON:
-{"recursos":[{"titulo":"...","fuente":"...","tipo":"Artículo","nivel":"Preparatoria","descripcion":"...","url":"https://...","idioma":"Español","procesable":true,"esVideo":false}],"consejo":"..."}`
-            }
-        ], true);
-
-        const data = JSON.parse(text);
-        const recursos = (data.recursos || []).map(r => ({ ...r, urlActiva: true }));
-        data.paraTarea     = recursos.filter(r => r.procesable && !r.esVideo);
-        data.materialExtra = recursos.filter(r => !r.procesable || r.esVideo);
-        data.recursos      = recursos;
-        res.json(data);
+        res.json({
+            recursos: [],
+            paraTarea: [],
+            materialExtra: [],
+            consejo: GEMINI_KEY
+                ? `No encontré fuentes finales verificadas para "${tema}". Intenta un tema más específico o pega/sube un PDF institucional directamente.`
+                : 'La búsqueda verificada requiere GEMINI_API_KEY en el backend.',
+            consultasSugeridas: [
+                `${tema} site:gob.mx filetype:pdf`,
+                `${tema} site:unam.mx filetype:pdf`,
+                `${tema} site:scielo.org.mx OR site:redalyc.org`
+            ],
+            fuenteIA: 'verificada_sin_resultados'
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
