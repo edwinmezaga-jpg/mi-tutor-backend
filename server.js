@@ -16,6 +16,8 @@ import {
     extraerYoutubeId as extraerYoutubeIdSeguro,
     esFuenteProhibida as esFuenteProhibidaSegura,
     esUrlEducativaFinal,
+    esDominioEducativo,
+    esPdfUrl,
     tipoArticuloEducativo,
     dominioBase
 } from './resourceQuality.js';
@@ -117,24 +119,47 @@ function buildLocalDateTime(fecha, hora) {
     return parseOptionalDate(`${fecha}T${hora || '23:59'}:00-07:00`);
 }
 
+// Mensaje fijo de rechazo para el tutor del alumno
+const TUTOR_RECHAZO = 'No te puedo ayudar con eso. Soy tu tutor y solo respondo dudas escolares. Pregúntame del tema que estás estudiando.';
+
+// Patrones de moderación para el tutor del alumno
+// — groserías, contenido sexual, armas/violencia, temas claramente no escolares
+const PATRON_MODERACION_ALUMNO = /\b(ch[i1]ng[aoe]|put[ao]s?|c[au]br[o0]n|g[uü]e[iy]|pend[e3]j[oa]|mam[ao]das?|v[e3]rg[ao]|c[ao]g[e3]r|cul[eo]|m[ae]rd[ao]|maricon|m[ao]r[o0]n|h[i1]j[oa]\s*d[e3]\s*(put|su)|c[ao]b[ae]z[ao]\s*(d[e3]\s*)?v[e3]rg|j[ao]d[e3]r|f[o0]ll[ao]r|pin[a]?c[h]e|c[ao]raj[e]|t[u]rt[ao]|nig+|f[a4]ck|sh[i1]t|b[i1]tch|c[u]nt|wh[o0]re|a[s5][s5]h[o0]l[e3])\b|\b(sex[o0]s?|porn[oa]?|p[o0]rn[o0]|xxx|c[o0]nt[e3]nid[o0]\s*adult[o0]|d[e3]sn[u]d[o0]|erotic[o0]|kama\s*sutra|masturbaci[o0]n|relaci[o0]n[e3]s?\s*s[e3]xu[a4]l[e3]s?|t[e3]n[e3]r\s*s[e3]x[o0]|follar|coger\s*con)\b|\b([a4]rm[a4]s?|pist[o0]l[a4]|[a4]k[- ]?47|[a4]r[- ]?15|bomb[a4]s?|[e3]xpl[o0]siv[o0]|[e3]xpl[o0]tar\s*(c[o0]n\s*)?un[a4]?|c[o0]m[o0]\s*m[a4]tar|[a4]s[e3]sin[a4]r|m[a4]tar\s*[a4]\s*algu|narco|[a4]ssassinate|kill|c[o0]m[o0]\s*h[a4]c[e3]r\s*un[a4]?\s*(bomb|[a4]rm|[e3]xpl)|gr[a4]n[a4]d[a4]|fusil|r[i1]fl[e3])\b/i;
+
+// Palabras fuera de contexto escolar (solo para alumno sin contexto de clase)
+const PATRON_NO_ESCOLAR = /\b(qu[e3]\s*(parti[d]?[o0]|[e3]quipo|jug[a4]d[o0]r|g[o0]l)\s*(gan[o0]|anot[o0]|jug[o0]|marc[o0])|marca[d]?or\s*d[e3]\s*(ayer|hoy)|result[a4]d[o0]\s*d[e3]l?\s*parti[d]?[o0]|apostemos|qu[i1][e3]n\s*gan[o0]\s*(ayer|hoy)|novia|novio|ligar|citas?\s*(am[o0]r[o0]sas?)?|chisme|instagrammer|youtuber|tiktok(er)?|influencer|casino|apuesta|cripto|bitcoin|doge|nft|meme|videojueg[o0]|fortnite|minecraft|roblox|call\s*of\s*duty|gta\s*[0-9])\b/i;
+
 function chatGuardrail(rol, pregunta, hasContext = true) {
     const q = (pregunta || '').toLowerCase();
+
+    // Para el alumno: filtro estricto de moderación (groserías, sexo, violencia/armas)
+    if (rol === 'alumno') {
+        if (PATRON_MODERACION_ALUMNO.test(pregunta)) {
+            return { ok: false, answer: TUTOR_RECHAZO };
+        }
+        // Temas claramente no escolares, solo cuando no hay contexto de clase
+        if (!hasContext && PATRON_NO_ESCOLAR.test(pregunta)) {
+            return { ok: false, answer: TUTOR_RECHAZO };
+        }
+        if (!hasContext) {
+            return { ok: false, answer: 'No puedo responder sin una clase o tarea activa. Abre una tarea o genera una clase y con gusto te ayudo sobre ese material.' };
+        }
+        return { ok: true };
+    }
+
+    // Para otros roles: filtro más amplio pero menos estricto en mensajes
     const forbidden = [
-        'novia','novio','ligar','apuesta','casino','crypto','bitcoin','dinero rapido',
-        'hack','hackear','arma','drogas','sexo','porno','politica partidista','chisme',
+        'ligar','apuesta','casino','crypto','bitcoin','dinero rapido',
+        'hack','hackear','drogas','sexo','porno','politica partidista','chisme',
         'instagram','tiktok','facebook','whatsapp personal','meme','videojuego'
     ];
-    if (forbidden.some(w => q.includes(w))) {
+    if (forbidden.some(w => q.includes(w)) || PATRON_MODERACION_ALUMNO.test(pregunta)) {
         const scope = {
-            alumno: 'tu clase, tarea activa y dudas educativas relacionadas',
             maestro: 'tus grupos, tareas, alumnos, resultados y estrategias pedagogicas',
             director: 'tu institucion, maestros, grupos, alumnos y metricas escolares',
             admin: 'operacion del sistema, usuarios, costos, despliegue y soporte'
         }[rol] || 'este modulo';
         return { ok: false, answer: `No puedo ayudarte con eso desde este chat. Aqui solo puedo apoyar con ${scope}.` };
-    }
-    if (rol === 'alumno' && !hasContext) {
-        return { ok: false, answer: 'No puedo responder sin una clase o tarea activa. Abre una tarea o genera una clase y con gusto te ayudo sobre ese material.' };
     }
     return { ok: true };
 }
@@ -170,10 +195,50 @@ console.log(`🤖 Motor IA: ${GEMINI_KEY ? `Gemini (${GEMINI_MODEL})` : `GROQ ($
 
 
 // ══ MONGODB ══
+// Cache global de la escuela única — se llena en bootstrapEscuelaUnica() tras conectar.
+let ESCUELA_DEFAULT_ID = null;
+function getEscuelaDefaultId() { return ESCUELA_DEFAULT_ID; }
+
 if (process.env.MONGODB_URI) {
     mongoose.connect(process.env.MONGODB_URI)
-        .then(() => console.log('✅ MongoDB conectado'))
+        .then(async () => {
+            console.log('✅ MongoDB conectado');
+            try { await bootstrapEscuelaUnica(); }
+            catch (e) { console.error('❌ bootstrapEscuelaUnica falló:', e.message); }
+        })
         .catch(e => console.error('❌ MongoDB error:', e.message));
+}
+
+// Modelo single-school: el sistema asume UNA escuela.
+// Crea/identifica la default y rellena escuelaId en docs huérfanos para que
+// el director (también en esta escuela) vea todo lo creado automáticamente.
+async function bootstrapEscuelaUnica() {
+    const existente = await Escuela.findOne().sort({ creadoEn: 1 }).lean();
+    let id;
+    if (existente) {
+        id = existente._id;
+        console.log(`🏫 Escuela única detectada: "${existente.nombre}" (${id})`);
+    } else {
+        const nueva = await Escuela.create({ nombre: 'Escuela Única', ciudad: 'Tijuana' });
+        id = nueva._id;
+        console.log(`🏫 Escuela única creada: "${nueva.nombre}" (${id})`);
+    }
+    ESCUELA_DEFAULT_ID = id;
+
+    // Backfill de docs sin escuelaId (asume escuela única — válido en este modelo).
+    const setOp = { $set: { escuelaId: id } };
+    const filtro = { $or: [{ escuelaId: null }, { escuelaId: { $exists: false } }] };
+    const [m, d, g, a, t] = await Promise.all([
+        Maestro.updateMany(filtro, setOp),
+        Director.updateMany(filtro, setOp),
+        Grupo.updateMany(filtro, setOp),
+        Alumno.updateMany(filtro, setOp),
+        Tarea.updateMany(filtro, setOp)
+    ]);
+    const total = (m.modifiedCount||0)+(d.modifiedCount||0)+(g.modifiedCount||0)+(a.modifiedCount||0)+(t.modifiedCount||0);
+    if (total > 0) {
+        console.log(`🔁 Backfill escuelaId: ${m.modifiedCount} maestros, ${d.modifiedCount} directores, ${g.modifiedCount} grupos, ${a.modifiedCount} alumnos, ${t.modifiedCount} tareas.`);
+    }
 }
 
 app.get('/api/health', (req, res) => {
@@ -248,6 +313,9 @@ const grupoSchema = new mongoose.Schema({
     semestre:  String,
     materia:   String,
     maestroId: { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true },
+    escuelaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
+    // Turno: feature futura (matutino/vespertino). UI deshabilitada por ahora.
+    turno:     { type: String, enum: ['matutino', 'vespertino', null], default: null },
     creadoEn:  { type: Date, default: Date.now }
 });
 const Grupo = mongoose.models.Grupo || mongoose.model('Grupo', grupoSchema);
@@ -297,6 +365,7 @@ const tareaSchema = new mongoose.Schema({
     shortId:   { type: String, unique: true, index: true },
     maestroId: { type: mongoose.Schema.Types.ObjectId, ref: 'Maestro', index: true },
     grupoId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    escuelaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
     titulo:    String,
     abstract:  String,       // resumen breve generado por IA para la tarjeta
     resumen:   String,       // clase magistral completa
@@ -382,6 +451,7 @@ const alumnoSchema = new mongoose.Schema({
     email:             { type: String, required: true, unique: true, index: true },
     passwordHash:      { type: String, required: true },
     grupoId:           { type: mongoose.Schema.Types.ObjectId, ref: 'Grupo', index: true },
+    escuelaId:         { type: mongoose.Schema.Types.ObjectId, ref: 'Escuela', index: true, default: null },
     activo:            { type: Boolean, default: true },
     sesionesHoy:       { type: Number, default: 0 },
     ultimaFechaSesion: { type: String, default: '' },
@@ -523,8 +593,11 @@ app.get('/api/admin/escuelas', verifyAdmin, async (req, res) => {
 app.post('/api/admin/director', verifyAdmin, async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
-        const { nombre, email, password, escuelaId } = req.body;
-        if (!nombre || !email || !password || !escuelaId) return res.status(400).json({ error: 'Faltan campos (nombre, email, contraseña y escuela son obligatorios).' });
+        const { nombre, email, password } = req.body;
+        // Modelo single-school: si no llega escuelaId, usar la escuela única.
+        const escuelaId = req.body.escuelaId || ESCUELA_DEFAULT_ID;
+        if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan campos (nombre, email y contraseña son obligatorios).' });
+        if (!escuelaId) return res.status(400).json({ error: 'No hay escuela configurada todavía. Reinicia el servidor.' });
         if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
         const existe = await Director.findOne({ email: email.toLowerCase() });
         if (existe) return res.status(409).json({ error: 'Ya existe un director con ese email.' });
@@ -864,9 +937,14 @@ app.post('/api/admin/alumno', verifyAdmin, async (req, res) => {
         const existe = await Alumno.findOne({ email: email.toLowerCase() });
         if (existe) return res.status(409).json({ error: 'Ya existe un alumno con ese email.' });
         const passwordHash = await bcrypt.hash(password, 10);
+        let escuelaIdAlumno = ESCUELA_DEFAULT_ID;
+        if (grupoId) {
+            const g = await Grupo.findById(grupoId).select('escuelaId').lean();
+            if (g?.escuelaId) escuelaIdAlumno = g.escuelaId;
+        }
         const alumno = await Alumno.create({
             nombre, email: email.toLowerCase(), passwordHash,
-            grupoId: grupoId || null, activo: true
+            grupoId: grupoId || null, escuelaId: escuelaIdAlumno, activo: true
         });
         res.json({ alumno: { _id: alumno._id, nombre: alumno.nombre, email: alumno.email, grupoId: alumno.grupoId } });
     } catch(e) { res.status(500).json({ error: e.message }); }
@@ -878,13 +956,18 @@ app.post('/api/admin/alumnos/bulk', verifyAdmin, async (req, res) => {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
         const { alumnos, grupoId } = req.body; // alumnos: [{nombre, email, password}]
         if (!alumnos?.length) return res.status(400).json({ error: 'Sin alumnos en la lista.' });
+        let escuelaIdBulk = ESCUELA_DEFAULT_ID;
+        if (grupoId) {
+            const g = await Grupo.findById(grupoId).select('escuelaId').lean();
+            if (g?.escuelaId) escuelaIdBulk = g.escuelaId;
+        }
         const resultados = { creados: 0, errores: [] };
         for (const a of alumnos) {
             try {
                 const existe = await Alumno.findOne({ email: a.email.toLowerCase() });
                 if (existe) { resultados.errores.push(`${a.email}: ya existe`); continue; }
                 const passwordHash = await bcrypt.hash(a.password || 'Tutor2025!', 10);
-                await Alumno.create({ nombre: a.nombre, email: a.email.toLowerCase(), passwordHash, grupoId: grupoId || null, activo: true });
+                await Alumno.create({ nombre: a.nombre, email: a.email.toLowerCase(), passwordHash, grupoId: grupoId || null, escuelaId: escuelaIdBulk, activo: true });
                 resultados.creados++;
             } catch(e) { resultados.errores.push(`${a.email}: ${e.message}`); }
         }
@@ -1341,7 +1424,9 @@ async function extraerTextoWeb(url) {
 
 // ── Verificación paralela de URLs educativas finales.
 // HEAD es rápido, pero algunas instituciones lo bloquean; por eso hay GET ligero como respaldo.
-async function verificarUrlEducativa(url, timeoutMs = 4500) {
+// Si la verificación de red falla pero el dominio es de la whitelist (gob.mx, unam.mx, scielo, etc.) o es PDF,
+// asumimos que es confiable — preferimos mostrar un link educativo lento/lento que cero resultados.
+async function verificarUrlEducativa(url, timeoutMs = 9000) {
     const limpia = limpiarTrackingUrl(url);
     if (!esUrlEducativaFinal(limpia)) return { originalUrl: limpia, url: limpia, ok: false, motivo: 'no-educativa-final' };
 
@@ -1379,10 +1464,14 @@ async function verificarUrlEducativa(url, timeoutMs = 4500) {
         }
     } catch {}
 
+    // Fallback: dominio confiable o PDF aunque la red haya fallado/timed-out.
+    if (esDominioEducativo(limpia) || esPdfUrl(limpia)) {
+        return { originalUrl: limpia, url: limpia, ok: true, tipo: tipoArticuloEducativo(limpia), motivo: 'asumido-confiable', contentType: '' };
+    }
     return { originalUrl: limpia, url: limpia, ok: false, motivo: 'inaccesible' };
 }
 
-async function verificarUrlsEducativasParalelo(urls, timeoutMs = 4500) {
+async function verificarUrlsEducativasParalelo(urls, timeoutMs = 9000) {
     const resultados = await Promise.all(urls.map(u => verificarUrlEducativa(u, timeoutMs)));
     const validas = new Map();
     resultados.filter(r => r.ok).forEach(r => {
@@ -1453,22 +1542,25 @@ async function filtrarYverificarRecursos(data) {
     data.videos = videoChecks.filter(Boolean);
 
     // 3) Verificar artículos/PDFs por red y conservar solo URLs finales institucionales/PDF.
+    //    El verificador acepta dominios confiables aunque la red tarde/falle (asumido-confiable).
     if (data.articulos.length) {
-        const validas = await verificarUrlsEducativasParalelo(data.articulos.map(a => a.url), 4500);
+        const validas = await verificarUrlsEducativasParalelo(data.articulos.map(a => a.url), 9000);
         data.articulos = data.articulos.map(a => {
             const check = validas.get(limpiarTrackingUrl(a.url));
             return check ? { ...a, url: check.url, tipo: check.tipo === 'PDF' ? 'PDF' : 'Artículo', urlActiva: true } : null;
         }).filter(Boolean);
     }
 
-    // 4) Diversidad de dominios en artículos (máx 1 por dominio)
-    const dominiosVistos = new Set();
+    // 4) Diversidad de dominios en artículos (máx 3 por dominio, cap total 12).
+    const conteoPorDominio = new Map();
     data.articulos = data.articulos.filter(a => {
         const d = dominioBase(a.url);
-        if (!d || dominiosVistos.has(d)) return false;
-        dominiosVistos.add(d);
+        if (!d) return false;
+        const n = conteoPorDominio.get(d) || 0;
+        if (n >= 3) return false;
+        conteoPorDominio.set(d, n + 1);
         return true;
-    });
+    }).slice(0, 12);
     return data;
 }
 
@@ -1562,9 +1654,13 @@ Responde SOLO con este JSON exacto:
         try { data = JSON.parse(texto.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim()); }
         catch { return null; }
 
-        // 1) Filtrar a SOLO URLs presentes en groundingMetadata (citas reales)
+        // 1) Filtrar a URLs presentes en groundingMetadata (citas reales)
+        //    SOLO se aplica si grounding trajo ≥2 citas — con 0 o 1 cita es probable que
+        //    la metadata no se haya poblado bien y filtrar a ciegas elimina todo.
+        //    Además se respetan dominios confiables (whitelist) y PDFs aunque no estén citados,
+        //    para no descartar buenas fuentes institucionales que google_search no expuso bien.
         const urlsConfiables = extraerUrlsDeGroundingMetadata(candidate);
-        if (urlsConfiables.size > 0) {
+        if (urlsConfiables.size >= 2) {
             const isCited = (url) => {
                 if (!url) return false;
                 if (urlsConfiables.has(url)) return true;
@@ -1587,8 +1683,9 @@ Responde SOLO con este JSON exacto:
                 } catch {}
                 return false;
             };
-            data.videos    = (data.videos || []).filter(v => isCited(v.url));
-            data.articulos = (data.articulos || []).filter(a => isCited(a.url));
+            const trustedOrCited = (url) => isCited(url) || esDominioEducativo(url) || esPdfUrl(url);
+            data.videos    = (data.videos || []).filter(v => isCited(v.url)); // videos sí estrictos
+            data.articulos = (data.articulos || []).filter(a => trustedOrCited(a.url));
         }
 
         // 2) Filtrar fuentes prohibidas + verificar oEmbed YouTube + diversidad dominios
@@ -2037,6 +2134,12 @@ REGLAS ESTRICTAS:
 - Si el alumno se equivoca, corrígelo con amabilidad y explica por qué
 - Máximo 3 párrafos, usa emojis con moderación
 - Habla en español mexicano natural
+
+MODERACIÓN OBLIGATORIA:
+- Si la pregunta contiene groserías, insultos, lenguaje obsceno o violento, responde EXACTAMENTE: "No te puedo ayudar con eso. Soy tu tutor y solo respondo dudas escolares. Pregúntame del tema que estás estudiando." — sin agregar nada más.
+- Si la pregunta es sobre contenido sexual, armas, explosivos, drogas, o cómo hacer daño a alguien, responde EXACTAMENTE ese mismo mensaje.
+- Si la pregunta no tiene NINGÚN contexto escolar o académico (resultados deportivos del día, chismes, redes sociales, videojuegos sin contexto educativo), responde EXACTAMENTE ese mismo mensaje.
+- Si la pregunta está mínimamente relacionada con estudiar, con una materia, con la salud, la historia, la ciencia, el deporte como disciplina educativa o cualquier tema de preparatoria, RESPONDE NORMALMENTE y sé generoso.
 
 ${contextoCompleto ? `\n=== MATERIAL DE LA CLASE ===\n${contextoCompleto}\n=== FIN ===` : '\nNota: No hay clase activa, responde preguntas generales educativas de preparatoria.'}` },
             ...histMsgs,
@@ -2792,9 +2895,9 @@ app.post('/api/maestro/registro', async (req, res) => {
         const existe = await Maestro.findOne({ email: inv.email });
         if (existe) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Usa el login en lugar de registro.', code: 'EMAIL_TAKEN' });
 
-        // Crear maestro
+        // Crear maestro (escuela única auto-asignada)
         const passwordHash = await bcrypt.hash(password, 10);
-        const maestro = await Maestro.create({ nombre: inv.nombre, email: inv.email, passwordHash });
+        const maestro = await Maestro.create({ nombre: inv.nombre, email: inv.email, passwordHash, escuelaId: ESCUELA_DEFAULT_ID });
 
         // Crear grupos automáticamente según la invitación
         for (const g of (inv.grupos || [])) {
@@ -2805,7 +2908,8 @@ app.post('/api/maestro/registro', async (req, res) => {
                 nombre: `${g.materia} — ${g.semestre}`,
                 semestre: g.semestre,
                 materia: g.materia,
-                maestroId: maestro._id
+                maestroId: maestro._id,
+                escuelaId: ESCUELA_DEFAULT_ID
             });
         }
 
@@ -2846,7 +2950,7 @@ app.post('/api/maestro/grupo', verifyToken, async (req, res) => {
         const existe = await Grupo.findOne({ maestroId: req.maestro.id, semestre, materia });
         if (existe) return res.status(409).json({ error: 'Ya tienes ese grupo creado.' });
         const shortId = await shortIdUnico(Grupo);
-        const grupo = await Grupo.create({ shortId, nombre, semestre, materia, maestroId: req.maestro.id });
+        const grupo = await Grupo.create({ shortId, nombre, semestre, materia, maestroId: req.maestro.id, escuelaId: ESCUELA_DEFAULT_ID });
         res.json(grupo);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2878,7 +2982,7 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
         let grupoCtx = null;
         if (grupoId && mongoose.connection.readyState) {
             grupoCtx = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id })
-                .select('materia semestre').lean();
+                .select('materia semestre escuelaId').lean();
         }
 
         // Generar clase + pool de 15 preguntas
@@ -2895,6 +2999,7 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
             shortId,
             maestroId: req.maestro.id,
             grupoId:   grupoId || null,
+            escuelaId: grupoCtx?.escuelaId || ESCUELA_DEFAULT_ID,
             titulo:    generated.titulo,
             abstract:  generated.abstract || '',
             resumen:   generated.resumen,
@@ -3086,7 +3191,7 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
         let grupoCtx = null;
         if (grupoId && mongoose.connection.readyState) {
             grupoCtx = await Grupo.findOne({ _id: grupoId, maestroId: req.maestro.id })
-                .select('materia semestre').lean();
+                .select('materia semestre escuelaId').lean();
         }
         const meta = {
             maestroId: req.maestro.id,
@@ -3098,6 +3203,7 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
         const shortId = await shortIdUnico(Tarea);
         const tarea = await Tarea.create({
             shortId, maestroId: req.maestro.id, grupoId: grupoId || null,
+            escuelaId: grupoCtx?.escuelaId || ESCUELA_DEFAULT_ID,
             titulo:    generated.titulo,
             abstract:  generated.abstract || '',
             resumen:   generated.resumen,
@@ -3764,7 +3870,8 @@ app.post('/api/admin/maestro/:maestroId/grupo', verifyAdmin, async (req, res) =>
         const shortId = await shortIdUnico(Grupo);
         const grupo = await Grupo.create({
             shortId, nombre: `${materia} — ${semestre}`,
-            semestre, materia, maestroId
+            semestre, materia, maestroId,
+            escuelaId: maestro.escuelaId || ESCUELA_DEFAULT_ID
         });
         res.json({ grupo });
     } catch(e) { res.status(500).json({ error: e.message }); }
