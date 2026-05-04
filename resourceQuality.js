@@ -1,3 +1,15 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  TUTOR IA — resourceQuality.js
+//  v2.0.0.6 — añade scoring 0–100 y tier OK_DOMAINS para mayor cobertura
+//             cuando Gemini grounding devuelve poco (fix Bug 3).
+//  Cambios:
+//   - Khan Academy sale de BANNED (es educativo confiable)
+//   - Se añade EDUCATIONAL_OK_DOMAINS (segunda capa: BBC Bitesize, NatGeo
+//     Education, openstax, archive.org/details, TED-Ed, Coursera, etc.)
+//   - puntuarRecurso(url, ctx) → 0–100 para ranking, no filtro binario
+//   - esUrlEducativaFinal(url) sigue funcionando (compat) = score >= 50
+// ═══════════════════════════════════════════════════════════════════════
+
 const TRACKING_PARAMS = new Set([
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
     'utm_id', 'utm_name', 'utm_reader', 'utm_viz_id', 'utm_pubreferrer',
@@ -5,15 +17,17 @@ const TRACKING_PARAMS = new Set([
     'feature', 'ab_channel', 'pp'
 ]);
 
+// Bloqueados: Wikipedia se mantiene fuera (queremos fuentes primarias).
+// Khan Academy SE QUITA — es educativo confiable (videos + ejercicios).
 const BANNED_DOMAINS = [
     'wikipedia.org',
     'wikimedia.org',
     'wikiwand.com',
-    'khanacademy.org',
     'google.com',
     'google.com.mx'
 ];
 
+// Tier 1 — máxima confianza académica (universidades, gobierno, organismos)
 const TRUSTED_EDUCATIONAL_DOMAINS = [
     'gob.mx',
     'gov',
@@ -50,6 +64,29 @@ const TRUSTED_EDUCATIONAL_DOMAINS = [
     'oercommons.org',
     'worldbank.org',
     'cepal.org'
+];
+
+// Tier 2 — educativos confiables aunque no sean .edu/.gov (curados)
+const EDUCATIONAL_OK_DOMAINS = [
+    'khanacademy.org',           // Khan Academy
+    'es.khanacademy.org',
+    'bbc.co.uk',                  // BBC Bitesize y educativo
+    'bbc.com',
+    'nationalgeographic.com',
+    'nationalgeographic.org',
+    'natgeokids.com',
+    'ted.com',                    // TED Talks / TED-Ed
+    'ed.ted.com',
+    'coursera.org',
+    'edx.org',
+    'archive.org',                // archive.org/details (libros, docs)
+    'curriki.org',
+    'ck12.org',
+    'pbslearningmedia.org',
+    'crashcourse.com',
+    'commonsensemedia.org',
+    'profedeele.es',              // recursos pedagógicos en español
+    'educ.ar'                     // Educar.ar (Argentina, gobierno educativo)
 ];
 
 function parseUrl(url) {
@@ -143,10 +180,41 @@ export function esDominioEducativo(url) {
     return TRUSTED_EDUCATIONAL_DOMAINS.some(domain => hostMatches(host, domain));
 }
 
-export function esUrlEducativaFinal(url, contentType = '') {
+export function esDominioOkEducativo(url) {
+    const parsed = parseUrl(url);
+    if (!parsed) return false;
+    const host = hostname(parsed);
+    return EDUCATIONAL_OK_DOMAINS.some(domain => hostMatches(host, domain));
+}
+
+/**
+ * Puntúa un recurso 0–100. >=50 se considera aceptable.
+ *  - 100  → trusted educativo + PDF académico
+ *  - 90   → trusted educativo (universidad, gob)
+ *  - 80   → PDF en cualquier dominio no prohibido
+ *  - 70   → ok educativo (Khan, BBC, NatGeo, TED, archive.org…)
+ *  - 60   → video YouTube (válido como id, no canal/búsqueda)
+ *  - 0    → prohibido o búsqueda
+ */
+export function puntuarRecurso(url, contentType = '') {
     const cleaned = limpiarTrackingUrl(url);
-    if (esFuenteProhibida(cleaned)) return false;
-    return esPdfUrl(cleaned, contentType) || esDominioEducativo(cleaned);
+    if (esFuenteProhibida(cleaned)) return 0;
+
+    const isPdf = esPdfUrl(cleaned, contentType);
+    const trusted = esDominioEducativo(cleaned);
+    const okTier = esDominioOkEducativo(cleaned);
+    const isYoutube = esYoutubeVideoUrl(cleaned);
+
+    if (trusted && isPdf) return 100;
+    if (trusted) return 90;
+    if (isPdf) return 80;
+    if (okTier) return 70;
+    if (isYoutube) return 60;
+    return 30; // dominio no prohibido pero sin endorse específico
+}
+
+export function esUrlEducativaFinal(url, contentType = '') {
+    return puntuarRecurso(url, contentType) >= 50;
 }
 
 export function tipoArticuloEducativo(url, contentType = '') {

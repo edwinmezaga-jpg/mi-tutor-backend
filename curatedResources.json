@@ -1,0 +1,237 @@
+{
+  "matematicas": [
+    {
+      "titulo": "Matemáticas — OpenStax (libros gratuitos)",
+      "url": "https://openstax.org/subjects/math",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria", "bachillerato"],
+      "temas": ["álgebra", "cálculo", "trigonometría", "estadística", "geometría", "precálculo"],
+      "descripcion": "Libros de texto abiertos revisados por pares de OpenStax (Rice University). Cubre desde álgebra básica hasta cálculo multivariable.",
+      "score": 95
+    },
+    {
+      "titulo": "Khan Academy — Matemáticas en español",
+      "url": "https://es.khanacademy.org/math",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria", "preparatoria"],
+      "temas": ["aritmética", "álgebra", "geometría", "trigonometría", "cálculo", "probabilidad"],
+      "descripcion": "Curso completo de matemáticas con videos, ejercicios y evaluaciones. Adaptativo al nivel del estudiante.",
+      "score": 85
+    },
+    {
+      "titulo": "3Blue1Brown — Esencia del Cálculo",
+      "url": "https://www.youtube.com/watch?v=WUvTyaaNkzM",
+      "youtubeId": "WUvTyaaNkzM",
+      "tipo": "Video",
+      "grados": ["preparatoria", "universidad"],
+      "temas": ["cálculo", "derivadas", "integrales"],
+      "descripcion": "Serie visualmente impecable que explica el cálculo desde la intuición geométrica.",
+      "score": 90
+    },
+    {
+      "titulo": "MIT OpenCourseWare — Single Variable Calculus",
+      "url": "https://ocw.mit.edu/courses/18-01-single-variable-calculus-fall-2006/",
+      "tipo": "Articulo",
+      "grados": ["preparatoria", "universidad"],
+      "temas": ["cálculo", "derivadas", "integrales"],
+      "descripcion": "Curso completo de cálculo de una variable del MIT con notas, problemas y exámenes resueltos.",
+      "score": 95
+    }
+  ],
+  "fisica": [
+    {
+      "titulo": "OpenStax — Física Universitaria",
+      "url": "https://openstax.org/subjects/science",
+      "tipo": "PDF",
+      "grados": ["preparatoria", "bachillerato", "universidad"],
+      "temas": ["mecánica", "termodinámica", "ondas", "electromagnetismo", "óptica", "física moderna"],
+      "descripcion": "Libro de texto gratuito de física universitaria con ejercicios resueltos.",
+      "score": 95
+    },
+    {
+      "titulo": "NASA — Recursos Educativos",
+      "url": "https://www.nasa.gov/learning-resources/for-educators/",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria", "preparatoria"],
+      "temas": ["astronomía", "espacio", "física", "ciencia planetaria"],
+      "descripcion": "Materiales educativos oficiales de NASA: lecciones, simulaciones, datos reales de misiones espaciales.",
+      "score": 95
+    },
+    {
+      "titulo": "Khan Academy — Física",
+      "url": "https://es.khanacademy.org/science/physics",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["mecánica", "fuerzas", "energía", "ondas", "electricidad"],
+      "descripcion": "Curso de física con videos en español, ejercicios y simulaciones.",
+      "score": 85
+    }
+  ],
+  "quimica": [
+    {
+      "titulo": "OpenStax — Química",
+      "url": "https://openstax.org/details/books/chemistry-2e",
+      "tipo": "PDF",
+      "grados": ["preparatoria", "bachillerato"],
+      "temas": ["átomos", "enlaces", "estequiometría", "termodinámica", "ácidos y bases", "química orgánica"],
+      "descripcion": "Libro de química general gratuito con ejercicios resueltos.",
+      "score": 95
+    },
+    {
+      "titulo": "Tabla Periódica Interactiva — PTable",
+      "url": "https://ptable.com/?lang=es",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["tabla periódica", "elementos", "propiedades químicas"],
+      "descripcion": "Tabla periódica interactiva con propiedades, isótopos y compuestos por elemento.",
+      "score": 80
+    }
+  ],
+  "biologia": [
+    {
+      "titulo": "OpenStax — Biología 2e",
+      "url": "https://openstax.org/details/books/biology-2e",
+      "tipo": "PDF",
+      "grados": ["preparatoria", "bachillerato"],
+      "temas": ["célula", "genética", "evolución", "ecología", "fisiología", "fotosíntesis", "mitosis"],
+      "descripcion": "Libro de biología general gratuito alineado con currículo de bachillerato.",
+      "score": 95
+    },
+    {
+      "titulo": "National Geographic Education",
+      "url": "https://education.nationalgeographic.org/",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria", "preparatoria"],
+      "temas": ["ecosistemas", "biodiversidad", "geografía", "ciencias de la tierra"],
+      "descripcion": "Recursos educativos de National Geographic con artículos, videos y planes de clase.",
+      "score": 80
+    },
+    {
+      "titulo": "Khan Academy — Biología",
+      "url": "https://es.khanacademy.org/science/biology",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["célula", "ADN", "genética", "evolución", "fotosíntesis", "respiración celular"],
+      "descripcion": "Curso completo de biología con videos en español y ejercicios.",
+      "score": 85
+    }
+  ],
+  "historia": [
+    {
+      "titulo": "INEHRM — Instituto Nacional de Estudios Históricos",
+      "url": "https://www.inehrm.gob.mx/es/inehrm/Publicaciones",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["historia de méxico", "revolución mexicana", "independencia", "porfiriato", "siglo xx"],
+      "descripcion": "Publicaciones académicas oficiales sobre historia de México descargables en PDF.",
+      "score": 95
+    },
+    {
+      "titulo": "Colegio de México — Acervos digitales",
+      "url": "https://colmex.mx/acervos/",
+      "tipo": "Articulo",
+      "grados": ["preparatoria", "universidad"],
+      "temas": ["historia", "ciencias sociales", "humanidades"],
+      "descripcion": "Acervos digitales del Colegio de México con investigaciones y libros académicos.",
+      "score": 95
+    },
+    {
+      "titulo": "Crash Course World History",
+      "url": "https://www.youtube.com/playlist?list=PLBDA2E52FB1EF80C9",
+      "tipo": "Video",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["historia mundial", "civilizaciones", "imperios", "revoluciones"],
+      "descripcion": "Serie de YouTube con resúmenes claros de historia mundial.",
+      "score": 80
+    }
+  ],
+  "español": [
+    {
+      "titulo": "Real Academia Española — Diccionario",
+      "url": "https://dle.rae.es/",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria", "preparatoria"],
+      "temas": ["léxico", "ortografía", "gramática", "definiciones"],
+      "descripcion": "Diccionario oficial de la lengua española con definiciones, etimología y ejemplos.",
+      "score": 95
+    },
+    {
+      "titulo": "FUNDÉU — Recomendaciones de uso del español",
+      "url": "https://www.fundeu.es/",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["redacción", "ortografía", "estilo", "español correcto"],
+      "descripcion": "Fundación del Español Urgente: dudas de redacción y uso correcto del idioma.",
+      "score": 85
+    }
+  ],
+  "ingles": [
+    {
+      "titulo": "BBC Learning English",
+      "url": "https://www.bbc.co.uk/learningenglish/",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["gramática inglesa", "vocabulario", "pronunciación", "conversación"],
+      "descripcion": "Curso completo y gratuito para aprender inglés desde nivel básico hasta avanzado.",
+      "score": 90
+    },
+    {
+      "titulo": "Cambridge Dictionary — Spanish-English",
+      "url": "https://dictionary.cambridge.org/dictionary/english-spanish/",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["traducción", "vocabulario", "gramática"],
+      "descripcion": "Diccionario inglés-español con pronunciación y ejemplos en contexto.",
+      "score": 85
+    }
+  ],
+  "geografia": [
+    {
+      "titulo": "INEGI — Datos geográficos de México",
+      "url": "https://www.inegi.org.mx/temas/",
+      "tipo": "Articulo",
+      "grados": ["secundaria", "preparatoria"],
+      "temas": ["geografía mexicana", "demografía", "territorio", "estados"],
+      "descripcion": "Datos oficiales del INEGI sobre geografía, población y territorio de México.",
+      "score": 95
+    },
+    {
+      "titulo": "National Geographic Education — Geografía",
+      "url": "https://education.nationalgeographic.org/topic/geography/",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria"],
+      "temas": ["geografía mundial", "biomas", "climas", "continentes"],
+      "descripcion": "Recursos visuales sobre geografía mundial con mapas interactivos.",
+      "score": 80
+    }
+  ],
+  "default": [
+    {
+      "titulo": "Khan Academy — Inicio",
+      "url": "https://es.khanacademy.org/",
+      "tipo": "Articulo",
+      "grados": ["primaria", "secundaria", "preparatoria"],
+      "temas": ["matemáticas", "ciencias", "programación", "humanidades"],
+      "descripcion": "Plataforma educativa gratuita con cursos en todas las materias en español.",
+      "score": 80
+    },
+    {
+      "titulo": "OpenStax — Libros de texto gratuitos",
+      "url": "https://openstax.org/subjects",
+      "tipo": "Articulo",
+      "grados": ["preparatoria", "universidad"],
+      "temas": ["ciencias", "humanidades", "negocios", "matemáticas"],
+      "descripcion": "Libros de texto universitarios gratuitos revisados por pares.",
+      "score": 90
+    },
+    {
+      "titulo": "MIT OpenCourseWare",
+      "url": "https://ocw.mit.edu/",
+      "tipo": "Articulo",
+      "grados": ["preparatoria", "universidad"],
+      "temas": ["ciencias", "ingeniería", "humanidades"],
+      "descripcion": "Cursos completos del MIT disponibles gratuitamente.",
+      "score": 90
+    }
+  ]
+}
