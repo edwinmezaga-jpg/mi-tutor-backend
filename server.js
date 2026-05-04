@@ -19,15 +19,31 @@ import {
     esDominioEducativo,
     esPdfUrl,
     tipoArticuloEducativo,
-    dominioBase
+    dominioBase,
+    puntuarRecurso
 } from './resourceQuality.js';
+import {
+    callGemini,
+    callIA,
+    clasificarIntencion,
+    validateAgainstSchema,
+    getTelemetry as getAITelemetry,
+    SCHEMA_TAREA_MIN,
+    SCHEMA_LECCION_COMPLETA,
+    MODELS
+} from './aiClient.js';
+import {
+    obtenerRecursosConCascada,
+    fallbackPoolCurado,
+    getFallbackTelemetry
+} from './resourceFallbacks.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = 'Beta 2.0.0.5';
-const PACKAGE_VERSION = '2.0.0-beta.5';
+const APP_VERSION = 'Beta 2.0.0.6';
+const PACKAGE_VERSION = '2.0.0-beta.6';
 
 if (!process.env.JWT_SECRET) {
     console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
@@ -459,9 +475,94 @@ const alumnoSchema = new mongoose.Schema({
     resetToken:        { type: String, default: null },
     resetTokenExp:     { type: Date, default: null },
     logros:            { type: [String], default: [] }, // IDs de logros desbloqueados
+    // v2.0.0.6 — auditoría de datos del alumno + personalización de IA
+    temariosEstudiados:{ type: [{
+        tema:       { type: String },
+        fechaUltima:{ type: Date, default: Date.now },
+        vecesVista: { type: Number, default: 1 },
+        dominio:    { type: Number, default: 50, min: 0, max: 100 } // 0-100
+    }], default: [] },
+    nivelEstimado:     { type: Number, default: 50, min: 0, max: 100 },
+    interesesIA:       { type: [String], default: [] },
     creadoEn:          { type: Date, default: Date.now }
 });
 const Alumno = mongoose.models.Alumno || mongoose.model('Alumno', alumnoSchema);
+
+// ── Helper v2.0.0.6: contexto del alumno para personalizar prompts de IA
+async function getAlumnoContext(alumnoId) {
+    if (!alumnoId || !mongoose.connection.readyState) return null;
+    try {
+        const a = await Alumno.findById(alumnoId)
+            .select('nombre grupoId logros nivelEstimado temariosEstudiados interesesIA')
+            .populate({ path: 'grupoId', select: 'nombre semestre materia grado' })
+            .lean();
+        if (!a) return null;
+        const ultimas = await Sesion.find({ alumnoId })
+            .sort({ creadoEn: -1 }).limit(5)
+            .select('nombre titulo materia pct correctas total creadoEn').lean()
+            .catch(() => []);
+        return {
+            id: String(a._id),
+            nombre: a.nombre,
+            grupo:  a.grupoId?.nombre || '',
+            grado:  a.grupoId?.grado || a.grupoId?.semestre || '',
+            materia: a.grupoId?.materia || '',
+            nivelEstimado: a.nivelEstimado || 50,
+            logros: a.logros || [],
+            temasDominados: (a.temariosEstudiados || []).filter(t => t.dominio >= 70).slice(0, 5).map(t => t.tema),
+            temasRecientes: (a.temariosEstudiados || []).slice(-5).map(t => t.tema),
+            intereses: a.interesesIA || [],
+            ultimasSesiones: ultimas.map(s => ({ titulo: s.titulo || s.nombre, pct: s.pct, fecha: s.creadoEn }))
+        };
+    } catch (e) {
+        console.warn('getAlumnoContext error:', e.message);
+        return null;
+    }
+}
+
+function alumnoContextToPromptText(ctx) {
+    if (!ctx) return '';
+    const parts = [
+        `Alumno: ${ctx.nombre}`,
+        ctx.grado ? `Grado: ${ctx.grado}` : '',
+        ctx.materia ? `Materia: ${ctx.materia}` : '',
+        `Nivel estimado: ${ctx.nivelEstimado}/100`,
+        ctx.temasDominados?.length ? `Temas que ya domina: ${ctx.temasDominados.join(', ')}` : '',
+        ctx.temasRecientes?.length ? `Temas recientes: ${ctx.temasRecientes.join(', ')}` : '',
+        ctx.intereses?.length ? `Intereses: ${ctx.intereses.join(', ')}` : ''
+    ].filter(Boolean);
+    return parts.join(' · ');
+}
+
+// ── Helper: actualizar temariosEstudiados tras una sesión/lección
+async function actualizarTemarioAlumno(alumnoId, tema, dominio = 50) {
+    if (!alumnoId || !tema || !mongoose.connection.readyState) return;
+    try {
+        const a = await Alumno.findById(alumnoId);
+        if (!a) return;
+        a.temariosEstudiados = a.temariosEstudiados || [];
+        const t = String(tema).slice(0, 120).trim();
+        const idx = a.temariosEstudiados.findIndex(x => (x.tema || '').toLowerCase() === t.toLowerCase());
+        if (idx >= 0) {
+            const cur = a.temariosEstudiados[idx];
+            cur.fechaUltima = new Date();
+            cur.vecesVista = (cur.vecesVista || 1) + 1;
+            // Promedio ponderado: nuevo dominio pesa 40%
+            cur.dominio = Math.round((cur.dominio || 50) * 0.6 + Number(dominio || 50) * 0.4);
+        } else {
+            a.temariosEstudiados.push({ tema: t, fechaUltima: new Date(), vecesVista: 1, dominio });
+            if (a.temariosEstudiados.length > 50) a.temariosEstudiados = a.temariosEstudiados.slice(-50);
+        }
+        // Recalcular nivelEstimado: promedio de últimos 10 dominios
+        const recientes = a.temariosEstudiados.slice(-10).map(x => x.dominio || 50);
+        if (recientes.length) {
+            a.nivelEstimado = Math.round(recientes.reduce((s, n) => s + n, 0) / recientes.length);
+        }
+        await a.save();
+    } catch (e) {
+        console.warn('actualizarTemarioAlumno error:', e.message);
+    }
+}
 
 // Escuela
 const escuelaSchema = new mongoose.Schema({
@@ -2100,11 +2201,37 @@ app.post('/api/estudiar-archivo', verifyAlumno, checkLimiteDiario, upload.array(
 });
 
 // ══ CHAT ALUMNO — contexto completo de la clase ══
+//   v2.0.0.6: añadido router de intención. Si el alumno escribe "quiero
+//   aprender X" detecta la intención y sugiere generar una lección completa
+//   vía /api/alumno/leccion. El flujo conversacional sigue intacto.
 app.post('/api/chat', rateLimit(40, 60_000), async (req, res) => {
     try {
-        const { context, question: rawQuestion, sesionData, historial } = req.body;
+        const { context, question: rawQuestion, sesionData, historial, alumnoId } = req.body;
         const question = sanitizeChatInput(rawQuestion);
         if (!question) return res.status(400).json({ error: 'Falta la pregunta.' });
+
+        // v2.0.0.6 Router de intención — sólo cuando NO hay sesión activa
+        // (si está estudiando algo, asumimos que la pregunta es duda sobre eso)
+        if (!sesionData && (!historial || historial.length < 2)) {
+            try {
+                const ctxAlumno = alumnoId ? await getAlumnoContext(alumnoId).catch(() => null) : null;
+                const ctxText = alumnoContextToPromptText(ctxAlumno);
+                const intent = await clasificarIntencion(question, ctxText);
+                if (intent.intent === 'leccion' && intent.confianza >= 0.6 && intent.tema) {
+                    return res.json({
+                        intent: 'leccion',
+                        sugerenciaLeccion: {
+                            tema: intent.tema,
+                            gradoSugerido: intent.gradoSugerido || ctxAlumno?.grado || '',
+                            confianza: intent.confianza,
+                            mensaje: `¿Quieres que te arme una lección completa sobre "${intent.tema}"? Tendrá resumen, podcast, glosario, ejemplos, quiz y flashcards.`
+                        },
+                        // Mantener compat: el frontend viejo verá esto si no entiende `intent`
+                        answer: `Detecté que quieres aprender sobre "${intent.tema}". Si confirmas, te genero una lección completa. Si solo era una duda, escribe la pregunta más concreta.`
+                    });
+                }
+            } catch (e) { console.warn('intent router error:', e.message); }
+        }
 
         let contextoCompleto = '';
         if (sesionData) {
@@ -2149,6 +2276,98 @@ ${contextoCompleto ? `\n=== MATERIAL DE LA CLASE ===\n${contextoCompleto}\n=== F
         const answer = await iaCall(messages, false, { tipo: 'chat' });
         res.json({ answer });
     } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ v2.0.0.6 — LECCIÓN AUTO-GENERADA PARA EL ALUMNO ══
+//   El alumno escribe "qué quieres aprender hoy" → se genera lección completa
+//   reusando procesarConIA() (igual que el profesor pero con contexto del alumno).
+app.post('/api/alumno/leccion', rateLimit(15, 60_000), async (req, res) => {
+    try {
+        const { tema: rawTema, gradoOverride, alumnoId, materia } = req.body || {};
+        const tema = sanitizeChatInput(rawTema, 200);
+        if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema (al menos 3 caracteres).' });
+
+        // Cargar contexto del alumno si lo tenemos (personaliza el prompt)
+        const ctxAlumno = alumnoId ? await getAlumnoContext(alumnoId).catch(() => null) : null;
+        const ctxText = alumnoContextToPromptText(ctxAlumno);
+
+        // Construir un "sourceText" sintético — procesarConIA lo expandirá
+        const sourceText = [
+            `TEMA SOLICITADO POR EL ALUMNO: ${tema}`,
+            ctxText ? `CONTEXTO DEL ALUMNO: ${ctxText}` : '',
+            `INSTRUCCIONES: genera una lección magistral mexicana, completa y profunda sobre el tema, adaptada al nivel del alumno. Incluye resumen, podcast, glosario, ejemplos prácticos, quiz, flashcards y fuentes verificadas.`
+        ].filter(Boolean).join('\n\n');
+
+        const meta = {
+            alumnoId: alumnoId || null,
+            tipo: 'leccion-autogenerada',
+            materia: materia || ctxAlumno?.materia || '',
+            semestre: gradoOverride || ctxAlumno?.grado || ''
+        };
+        const generated = await procesarConIA(sourceText, meta);
+
+        // Validar que la IA respondió con estructura mínima usable
+        const v = validateAgainstSchema(generated, SCHEMA_LECCION_COMPLETA);
+        if (!v.ok || !generated?.titulo || !generated?.resumen) {
+            console.warn('[/api/alumno/leccion] IA inválida:', v.errors);
+            return res.status(422).json({
+                error: 'ia_invalida',
+                detail: 'No pude generar una lección completa para ese tema. Intenta con un tema más específico.',
+                errores: v.errors
+            });
+        }
+
+        // Persistir como sesión si tenemos alumnoId
+        if (alumnoId && mongoose.connection.readyState) {
+            try {
+                const shortId = await shortIdUnico(Sesion);
+                await Sesion.create({
+                    shortId, alumnoId,
+                    nombre: ctxAlumno?.nombre || 'Alumno',
+                    titulo: generated.titulo,
+                    materia: meta.materia, semestre: meta.semestre,
+                    tipo: 'leccion-autogenerada',
+                    creadoEn: new Date()
+                }).catch(() => {});
+                actualizarTemarioAlumno(alumnoId, tema, 50).catch(() => {});
+            } catch (e) { /* no bloquear si falla persistencia */ }
+        }
+
+        res.json({
+            ok: true,
+            leccion: generated,
+            meta: {
+                tema, materia: meta.materia, grado: meta.semestre,
+                alumnoNivel: ctxAlumno?.nivelEstimado || null,
+                fuente: 'auto-generada'
+            }
+        });
+    } catch (e) {
+        console.error('/api/alumno/leccion error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ══ v2.0.0.6 — HEALTH CHECK DE IA (telemetría) ══
+app.get('/api/admin/health/ia', (req, res) => {
+    try {
+        const ai = getAITelemetry();
+        const fb = getFallbackTelemetry();
+        res.json({
+            ok: true,
+            timestamp: new Date().toISOString(),
+            version: APP_VERSION,
+            ai,
+            fallbacks: fb,
+            recomendaciones: [
+                ai.gemini.calls === 0 && !ai.config.geminiKeySet ? 'Configura GEMINI_API_KEY' : null,
+                ai.gemini.calls > 0 && ai.gemini.successRate !== null && ai.gemini.successRate < 0.5 ? 'Tasa de éxito Gemini < 50% — revisa API key o cuota' : null,
+                !fb.config.youtubeKeySet ? 'Configura YOUTUBE_API_KEY para fallback de videos' : null,
+                !fb.config.googleCSESet ? 'Configura GOOGLE_CSE_ID + GOOGLE_CSE_KEY para fallback de PDFs académicos' : null,
+                ai.schemaFails > 5 ? `${ai.schemaFails} respuestas con JSON inválido — considera subir el modelo` : null
+            ].filter(Boolean)
+        });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ══ CHAT MAESTRO — SOLO datos internos del grupo ══
@@ -2620,66 +2839,87 @@ app.get('/api/maestro/analytics/:grupoId', verifyToken, async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ══ BÚSQUEDA DE RECURSOS EDUCATIVOS — GEMINI GROUNDING ══
+// ══ BÚSQUEDA DE RECURSOS EDUCATIVOS — v2.0.0.6 cascada ══
+//   Plan A: Gemini Grounding (encuentra recursos en tiempo real)
+//   Plan B: YouTube Data API + Google CSE en paralelo (videos + PDFs académicos)
+//   Plan C: Pool curado (~200 recursos preseleccionados)
+//   Garantiza nunca devolver vacío. Fix Bug 3.
 app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
     try {
-        const { tema } = req.body;
+        const { tema, grado, materia } = req.body;
         if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
 
-        // Intentar con Gemini Grounding primero (encuentra recursos REALES y actuales)
+        // Plan A — Gemini grounding
+        let recursosIA = [];
         if (GEMINI_KEY) {
             const recursos = await buscarRecursosEducativosIA(tema);
-            if (recursos && (recursos.videos?.length || recursos.articulos?.length)) {
-                // Construir respuesta compatible con el frontend
-                const paraTarea = [];
-                const materialExtra = [];
-
+            if (recursos) {
                 (recursos.articulos || []).forEach(a => {
-                    paraTarea.push({
-                        titulo: a.titulo, fuente: a.fuente, tipo: a.tipo || 'Artículo',
-                        nivel: 'Preparatoria', descripcion: a.descripcion,
-                        url: a.url, idioma: 'Español', procesable: true,
-                        esVideo: false, urlActiva: true
+                    if (!a.url) return;
+                    recursosIA.push({
+                        titulo: a.titulo, url: a.url, descripcion: a.descripcion || '',
+                        fuente: a.fuente || dominioBase(a.url),
+                        tipo: a.tipo || tipoArticuloEducativo(a.url),
+                        score: puntuarRecurso(a.url) || 70,
+                        fuenteOrigen: 'gemini', esVideo: false
                     });
                 });
-
                 (recursos.videos || []).forEach(v => {
-                    materialExtra.push({
-                        titulo: v.titulo, fuente: v.canal || 'YouTube',
-                        tipo: 'Video', nivel: 'Preparatoria',
-                        descripcion: `${v.descripcion}${v.duracion ? ' · ' + v.duracion : ''}`,
-                        url: v.url, idioma: 'Español', procesable: false,
-                        esVideo: true, urlActiva: true, videoId: v.videoId,
-                        thumbnail: v.thumbnail, reproducirEnTutor: false
+                    if (!v.url) return;
+                    recursosIA.push({
+                        titulo: v.titulo, url: v.url, youtubeId: v.videoId,
+                        descripcion: v.descripcion || '', canal: v.canal || 'YouTube',
+                        thumbnail: v.thumbnail, score: 65,
+                        fuenteOrigen: 'gemini', esVideo: true, tipo: 'Video'
                     });
-                });
-
-                return res.json({
-                    recursos: [...paraTarea, ...materialExtra],
-                    paraTarea,
-                    materialExtra,
-                    consejo: `Recursos encontrados en tiempo real para "${tema}". Los artículos puedes procesarlos directamente en Tutor IA. Los videos son del tema exacto.`,
-                    consultasSugeridas: recursos.consultas_sugeridas || [],
-                    fuenteIA: 'google_search'
                 });
             }
         }
 
+        // Plan B + C via cascada (sólo si A devolvió poco)
+        const todos = await obtenerRecursosConCascada({ tema, grado: grado || '', materia: materia || '', recursosIA });
+
+        // Reformatear al shape del frontend
+        const paraTarea = [];
+        const materialExtra = [];
+        for (const r of todos) {
+            const esVideo = r.esVideo || !!r.youtubeId || r.tipo === 'Video';
+            const item = {
+                titulo: r.titulo, fuente: r.fuente || r.canal || dominioBase(r.url || ''),
+                tipo: r.tipo || (esVideo ? 'Video' : 'Artículo'),
+                nivel: 'Preparatoria', descripcion: r.descripcion || '',
+                url: r.url, idioma: 'Español', procesable: !esVideo,
+                esVideo, urlActiva: true,
+                score: r.score || 50,
+                fuenteOrigen: r.fuenteOrigen || 'desconocido',
+                ...(esVideo && (r.youtubeId || r.videoId) ? { videoId: r.youtubeId || r.videoId } : {}),
+                ...(r.thumbnail ? { thumbnail: r.thumbnail } : {})
+            };
+            if (esVideo) materialExtra.push(item); else paraTarea.push(item);
+        }
+
+        const total = paraTarea.length + materialExtra.length;
+        const lowConfidence = total < 3;
+
         res.json({
-            recursos: [],
-            paraTarea: [],
-            materialExtra: [],
-            consejo: GEMINI_KEY
-                ? `No encontré fuentes finales verificadas para "${tema}". Intenta un tema más específico o pega/sube un PDF institucional directamente.`
-                : 'La búsqueda verificada requiere GEMINI_API_KEY en el backend.',
+            recursos: [...paraTarea, ...materialExtra],
+            paraTarea,
+            materialExtra,
+            consejo: total > 0
+                ? `Encontramos ${total} recursos para "${tema}".${lowConfidence ? ' Pocos resultados — intenta un tema más específico.' : ''}`
+                : `No se encontraron recursos para "${tema}". Sugerencia: usa términos más comunes o sube tu propio PDF.`,
             consultasSugeridas: [
                 `${tema} site:gob.mx filetype:pdf`,
                 `${tema} site:unam.mx filetype:pdf`,
                 `${tema} site:scielo.org.mx OR site:redalyc.org`
             ],
-            fuenteIA: 'verificada_sin_resultados'
+            fuenteIA: total > 0 ? 'cascada' : 'verificada_sin_resultados',
+            low_confidence: lowConfidence
         });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+        console.error('/api/maestro/recursos error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.post('/api/tutor/explicar-error', rateLimit(20, 60_000), verifyAlumno, async (req, res) => {
@@ -2994,6 +3234,18 @@ app.post('/api/maestro/tarea', verifyToken, async (req, res) => {
         };
         const generated = await procesarConIAPool(texto, meta);
 
+        // v2.0.0.6 Bug 1 fix: validar que la IA devolvió un JSON usable.
+        // Antes la tarea se creaba con campos undefined y "no quedaba" en UI.
+        const v = validateAgainstSchema(generated, SCHEMA_TAREA_MIN);
+        if (!v.ok) {
+            console.warn('[Bug1-fix] /api/maestro/tarea: IA devolvió JSON inválido:', v.errors);
+            return res.status(422).json({
+                error: 'ia_invalida',
+                detail: 'La IA no pudo procesar este material. Intenta de nuevo o ajusta el contenido fuente.',
+                errores: v.errors
+            });
+        }
+
         const shortId = await shortIdUnico(Tarea);
         const tarea = await Tarea.create({
             shortId,
@@ -3200,6 +3452,12 @@ app.post('/api/maestro/tarea-archivo', verifyToken, upload.array('archivos', 10)
             semestre: grupoCtx?.semestre
         };
         const generated = await procesarConIAPool(textoTotal, meta);
+        // v2.0.0.6 Bug 1 fix: validar JSON antes de crear tarea.
+        const v2 = validateAgainstSchema(generated, SCHEMA_TAREA_MIN);
+        if (!v2.ok) {
+            console.warn('[Bug1-fix] /api/maestro/tarea-archivo: IA inválida:', v2.errors);
+            return res.status(422).json({ error: 'ia_invalida', detail: 'La IA no pudo procesar el archivo. Intenta con un PDF/foto más claro.', errores: v2.errors });
+        }
         const shortId = await shortIdUnico(Tarea);
         const tarea = await Tarea.create({
             shortId, maestroId: req.maestro.id, grupoId: grupoId || null,
@@ -4310,6 +4568,9 @@ app.post('/api/examen/:shortId/entregar', verifyAlumno, async (req, res) => {
         if (examen.grupoId && alumno.grupoId && String(examen.grupoId) !== String(alumno.grupoId)) {
             return res.status(403).json({ error: 'Este examen no pertenece a tu grupo.' });
         }
+
+        // v2.0.0.6 Bug 2 fix: respuesta idempotente. Si ya entregó, devolvemos
+        // 200 con la entrega previa para que el frontend no se quede en estado "entregando…".
         const entregaExistente = await ExamenEntrega.findOne({ examenId: examen._id, alumnoId: alumno._id })
             .select('shortId respuestas correctas total pct entregaTarde retrasoMinutos').lean();
         if (entregaExistente) {
@@ -4325,6 +4586,7 @@ app.post('/api/examen/:shortId/entregar', verifyAlumno, async (req, res) => {
                 yaEntregado: true
             });
         }
+
         const respuestasInput = req.body.respuestas || {};
         let correctas = 0;
         const preguntasNormalizadas = normalizeQuestions(examen.preguntas);
@@ -4348,11 +4610,39 @@ app.post('/api/examen/:shortId/entregar', verifyAlumno, async (req, res) => {
         const pct = total ? Math.round((correctas / total) * 100) : 0;
         const estado = lateInfo(examen.fechaVencimiento);
         const shortId = await shortIdUnico(ExamenEntrega);
-        const entrega = await ExamenEntrega.create({
-            shortId, examenId: examen._id, alumnoId: alumno._id,
-            nombre: alumno.nombre, grupoId: examen.grupoId || alumno.grupoId,
-            respuestas, correctas, total, pct, ...estado
-        });
+
+        // v2.0.0.6: usar findOneAndUpdate atómico con upsert para evitar race conditions
+        // si el alumno hace doble click. Si ya hay entrega, devolvemos esa.
+        let entrega;
+        try {
+            entrega = await ExamenEntrega.create({
+                shortId, examenId: examen._id, alumnoId: alumno._id,
+                nombre: alumno.nombre, grupoId: examen.grupoId || alumno.grupoId,
+                respuestas, correctas, total, pct, ...estado
+            });
+        } catch (raceErr) {
+            // Duplicate key (race) → leer la existente
+            const existente = await ExamenEntrega.findOne({ examenId: examen._id, alumnoId: alumno._id })
+                .select('shortId respuestas correctas total pct entregaTarde retrasoMinutos').lean();
+            if (existente) {
+                return res.json({
+                    shortId: existente.shortId,
+                    detalles: existente.respuestas || [],
+                    correctas: existente.correctas,
+                    total: existente.total,
+                    pct: existente.pct,
+                    entregaTarde: existente.entregaTarde,
+                    retrasoMinutos: existente.retrasoMinutos,
+                    retrasoTexto: formatRetraso(existente.retrasoMinutos),
+                    yaEntregado: true
+                });
+            }
+            throw raceErr;
+        }
+
+        // v2.0.0.6: actualizar temario del alumno (sólo informativo)
+        actualizarTemarioAlumno(alumno._id, examen.titulo || 'Examen', pct).catch(() => {});
+
         res.json({
             shortId: entrega.shortId, detalles: respuestas, correctas, total, pct,
             entregaTarde: estado.entregaTarde,
@@ -5056,7 +5346,7 @@ app.get('/api/reto/:shortId', async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Entregar reto (alumno)
+// Entregar reto (alumno) — v2.0.0.6 Bug 2 fix: idempotente para evitar bloqueos
 app.post('/api/reto/:shortId/entregar', async (req, res) => {
     try {
         if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
@@ -5068,11 +5358,19 @@ app.post('/api/reto/:shortId/entregar', async (req, res) => {
         if (reto.fechaFin && new Date() > new Date(reto.fechaFin))
             return res.status(410).json({ error: 'Este reto ya expiró.' });
 
-        // Verificar si ya participó
+        // v2.0.0.6: si ya participó, devolvemos su resultado en 200 (idempotente)
+        // en vez de 409, así el frontend no se queda en estado "entregando…" tras un retry.
         const yaParticipó = reto.participantes.find(p => p.alumno === alumno);
-        if (yaParticipó) return res.status(409).json({
-            error: 'Ya completaste este reto.', pct: yaParticipó.pct, correctas: yaParticipó.correctas
-        });
+        if (yaParticipó) {
+            const ranking0 = [...reto.participantes].sort((a,b) => b.pct-a.pct || a.tiempo-b.tiempo)
+                .map((p,i) => ({ posicion: i+1, alumno: p.alumno, pct: p.pct }));
+            const miPos0 = ranking0.findIndex(r => r.alumno === alumno) + 1;
+            return res.json({
+                pct: yaParticipó.pct, correctas: yaParticipó.correctas, total: yaParticipó.total,
+                miPosicion: miPos0, totalParticipantes: reto.participantes.length,
+                detalles: [], yaEntregado: true
+            });
+        }
 
         // Calificar
         let correctas = 0;
@@ -5082,17 +5380,22 @@ app.post('/api/reto/:shortId/entregar', async (req, res) => {
             return { esCorrecta, correcta: q.r, seleccionada: respuestas[i], pregunta: q.p };
         });
         const total = reto.preguntas.length;
-        const pct   = Math.round((correctas / total) * 100);
+        const pct   = total ? Math.round((correctas / total) * 100) : 0;
 
-        reto.participantes.push({ alumno, alumnoId: alumnoId || null, pct, correctas, total, tiempo: tiempoUsado || 0 });
-        await reto.save();
+        // findOneAndUpdate atómico para evitar race
+        await Reto.updateOne(
+            { _id: reto._id, 'participantes.alumno': { $ne: alumno } },
+            { $push: { participantes: { alumno, alumnoId: alumnoId || null, pct, correctas, total, tiempo: tiempoUsado || 0 } } }
+        );
+        const retoFresh = await Reto.findById(reto._id).select('participantes').lean();
 
-        // Ranking actualizado
-        const ranking = [...reto.participantes].sort((a,b) => b.pct-a.pct || a.tiempo-b.tiempo)
+        const ranking = [...(retoFresh?.participantes || [])].sort((a,b) => b.pct-a.pct || a.tiempo-b.tiempo)
             .map((p,i) => ({ posicion: i+1, alumno: p.alumno, pct: p.pct }));
         const miPosicion = ranking.findIndex(r => r.alumno === alumno) + 1;
 
-        res.json({ pct, correctas, total, miPosicion, totalParticipantes: reto.participantes.length, detalles });
+        if (alumnoId) actualizarTemarioAlumno(alumnoId, reto.titulo || 'Reto', pct).catch(() => {});
+
+        res.json({ pct, correctas, total, miPosicion, totalParticipantes: ranking.length, detalles });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
