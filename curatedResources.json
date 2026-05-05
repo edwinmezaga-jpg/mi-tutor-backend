@@ -5,9 +5,18 @@
       "url": "https://openstax.org/subjects/math",
       "tipo": "Articulo",
       "grados": ["secundaria", "preparatoria", "bachillerato"],
-      "temas": ["álgebra", "cálculo", "trigonometría", "estadística", "geometría", "precálculo"],
+      "temas": ["álgebra", "ecuaciones", "ecuaciones cuadráticas", "funciones cuadráticas", "cálculo", "trigonometría", "estadística", "geometría", "precálculo"],
       "descripcion": "Libros de texto abiertos revisados por pares de OpenStax (Rice University). Cubre desde álgebra básica hasta cálculo multivariable.",
       "score": 95
+    },
+    {
+      "titulo": "Nueva Escuela Mexicana — Ecuaciones de la forma x² + bx + c = 0",
+      "url": "https://nemdigitalstorage.blob.core.windows.net/nem-main/ts/libros/Tercero/Matematicas/pp132-134-132.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "bachillerato"],
+      "temas": ["ecuaciones", "ecuaciones cuadráticas", "cuadráticas", "factorización", "álgebra"],
+      "descripcion": "PDF oficial de la SEP con actividad guiada para resolver ecuaciones cuadráticas de la forma x² + bx + c = 0.",
+      "score": 96
     },
     {
       "titulo": "Khan Academy — Matemáticas en español",
@@ -96,6 +105,15 @@
       "temas": ["célula", "genética", "evolución", "ecología", "fisiología", "fotosíntesis", "mitosis"],
       "descripcion": "Libro de biología general gratuito alineado con currículo de bachillerato.",
       "score": 95
+    },
+    {
+      "titulo": "Nueva Escuela Mexicana — Fotosíntesis: base de la pirámide ecológica",
+      "url": "https://nemdigitalstorage.blob.core.windows.net/nem-main/ts/libros/Primero/Ciencias-y-Tecnologia_Biologia/pp88-89-046.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "bachillerato"],
+      "temas": ["fotosíntesis", "flujo de energía", "ecosistemas", "autótrofos"],
+      "descripcion": "PDF oficial de la SEP sobre fotosíntesis, productores y flujo de energía en ecosistemas.",
+      "score": 96
     },
     {
       "titulo": "National Geographic Education",

@@ -27,6 +27,136 @@ const YOUTUBE_KEY    = process.env.YOUTUBE_API_KEY;
 const GOOGLE_CSE_ID  = process.env.GOOGLE_CSE_ID;
 const GOOGLE_CSE_KEY = process.env.GOOGLE_CSE_KEY;
 
+const providerDiagnostics = {
+    youtube: {
+        configured: !!YOUTUBE_KEY,
+        lastTriedAt: null,
+        lastOkAt: null,
+        lastStatus: null,
+        lastError: null,
+        probableCause: YOUTUBE_KEY ? null : 'not_configured'
+    },
+    googleCSE: {
+        configured: !!(GOOGLE_CSE_KEY && GOOGLE_CSE_ID),
+        optional: true,
+        lastTriedAt: null,
+        lastOkAt: null,
+        lastStatus: null,
+        lastError: null,
+        probableCause: (GOOGLE_CSE_KEY && GOOGLE_CSE_ID) ? null : 'not_configured'
+    }
+};
+
+let lastCascade = {
+    lastRunAt: null,
+    total: 0,
+    taskReadyCount: 0,
+    pdfCount: 0,
+    sourcesUsed: [],
+    lowConfidence: null
+};
+
+function cloneJSON(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function normalizeSearchText(value) {
+    return String(value || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function sanitizeProviderError(value) {
+    return String(value || '')
+        .replace(/key=[^&\s]+/gi, 'key=[redacted]')
+        .replace(/AIza[0-9A-Za-z_-]+/g, '[redacted]')
+        .slice(0, 220);
+}
+
+function classifyProviderIssue(provider, status, message) {
+    const msg = String(message || '').toLowerCase();
+    if (provider === 'googleCSE' && /closed|not available|not have access|permission|forbidden/.test(msg)) {
+        return 'closed_or_restricted';
+    }
+    if (status === 403 || status === 429 || /quota|restricted|rate|forbidden|permission|limit/.test(msg)) {
+        return 'quota_or_restriction';
+    }
+    if (status === 400 || /cx|search engine|api key|invalid/.test(msg)) {
+        return 'invalid_configuration';
+    }
+    if (/abort|timeout|timed out/.test(msg)) return 'timeout';
+    if (status && status >= 500) return 'provider_error';
+    return 'request_failed';
+}
+
+async function providerErrorMessage(res) {
+    let message = `HTTP ${res.status}`;
+    try {
+        const json = await res.json();
+        message = json?.error?.message || json?.message || message;
+    } catch {}
+    return message;
+}
+
+function markProviderAttempt(provider) {
+    providerDiagnostics[provider].lastTriedAt = new Date().toISOString();
+    providerDiagnostics[provider].lastStatus = null;
+    providerDiagnostics[provider].lastError = null;
+    providerDiagnostics[provider].probableCause = null;
+}
+
+function markProviderOk(provider, status) {
+    providerDiagnostics[provider].lastOkAt = new Date().toISOString();
+    providerDiagnostics[provider].lastStatus = status;
+    providerDiagnostics[provider].lastError = null;
+    providerDiagnostics[provider].probableCause = null;
+}
+
+function markProviderFailure(provider, status, error) {
+    const message = sanitizeProviderError(error);
+    providerDiagnostics[provider].lastStatus = status ?? null;
+    providerDiagnostics[provider].lastError = status ? `HTTP ${status}: ${message}` : message;
+    providerDiagnostics[provider].probableCause = classifyProviderIssue(provider, status, message);
+}
+
+function recordCascade(resultados) {
+    const sources = [...new Set(resultados.map(r => r?.fuenteOrigen || 'desconocido'))];
+    const taskReady = resultados.filter(esRecursoParaTarea);
+    const pdfs = taskReady.filter(esRecursoPdf);
+    lastCascade = {
+        lastRunAt: new Date().toISOString(),
+        total: resultados.length,
+        taskReadyCount: taskReady.length,
+        pdfCount: pdfs.length,
+        sourcesUsed: sources,
+        lowConfidence: resultados.length < 3 || taskReady.length === 0
+    };
+}
+
+function esRecursoVideo(r) {
+    return !!(r?.esVideo || r?.youtubeId || r?.videoId || r?.tipo === 'Video' || esYoutubeVideoUrl(r?.url || ''));
+}
+
+function esRecursoParaTarea(r) {
+    return !!(r?.url && !esRecursoVideo(r));
+}
+
+function esRecursoPdf(r) {
+    return esRecursoParaTarea(r) && (r?.tipo === 'PDF' || esPdfUrl(r?.url || ''));
+}
+
+function tieneFuentesParaTarea(lista) {
+    return lista.some(esRecursoParaTarea);
+}
+
+function tienePdf(lista) {
+    return lista.some(esRecursoPdf);
+}
+
 // Canales NO educativos a bloquear (música, gaming, vlogs random)
 const YOUTUBE_CHANNEL_BLACKLIST = new Set([
     'UCq-Fj5jknLsUf-MWSy4_brA', // T-Series (música)
@@ -93,12 +223,19 @@ export async function fallbackYoutube(query, grado = '', maxResults = 4) {
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=${maxResults * 3}` +
                 `&q=${q}&type=video&relevanceLanguage=es&videoDuration=medium&safeSearch=strict&key=${YOUTUBE_KEY}`;
 
+    let timer;
     try {
+        markProviderAttempt('youtube');
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
+        timer = setTimeout(() => controller.abort(), 8000);
         const res = await fetch(url, { signal: controller.signal });
         clearTimeout(timer);
-        if (!res.ok) return [];
+        if (!res.ok) {
+            const msg = await providerErrorMessage(res);
+            markProviderFailure('youtube', res.status, msg);
+            return [];
+        }
+        markProviderOk('youtube', res.status);
         const json = await res.json();
         const items = Array.isArray(json.items) ? json.items : [];
 
@@ -122,8 +259,11 @@ export async function fallbackYoutube(query, grado = '', maxResults = 4) {
         cacheSet(cacheKey, recursos);
         return recursos;
     } catch (e) {
+        markProviderFailure('youtube', null, e.message);
         console.warn('⚠️  fallbackYoutube error:', e.message);
         return [];
+    } finally {
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -138,16 +278,23 @@ export async function fallbackGoogleCSE(query, grado = '', maxResults = 5) {
     const hit = cacheGet(cacheKey);
     if (hit) return hit;
 
-    const q = encodeURIComponent(`${query} ${grado || ''}`.trim() + ' explicación educativa');
+    const q = encodeURIComponent(`${query} ${grado || ''}`.trim() + ' filetype:pdf guía material docente explicación educativa');
     const url = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_CSE_KEY}&cx=${GOOGLE_CSE_ID}` +
                 `&q=${q}&num=${Math.min(maxResults, 10)}&lr=lang_es&safe=active`;
 
+    let timer;
     try {
+        markProviderAttempt('googleCSE');
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
+        timer = setTimeout(() => controller.abort(), 8000);
         const res = await fetch(url, { signal: controller.signal });
         clearTimeout(timer);
-        if (!res.ok) return [];
+        if (!res.ok) {
+            const msg = await providerErrorMessage(res);
+            markProviderFailure('googleCSE', res.status, msg);
+            return [];
+        }
+        markProviderOk('googleCSE', res.status);
         const json = await res.json();
         const items = Array.isArray(json.items) ? json.items : [];
 
@@ -172,8 +319,11 @@ export async function fallbackGoogleCSE(query, grado = '', maxResults = 5) {
         cacheSet(cacheKey, recursos);
         return recursos;
     } catch (e) {
+        markProviderFailure('googleCSE', null, e.message);
         console.warn('⚠️  fallbackGoogleCSE error:', e.message);
         return [];
+    } finally {
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -182,19 +332,27 @@ export async function fallbackGoogleCSE(query, grado = '', maxResults = 5) {
 // ─────────────────────────────────────────────────────────────────────────
 export async function fallbackPoolCurado(query = '', grado = '', materia = '') {
     const pool = await loadCuratedPool();
-    const queryLower = (query || '').toLowerCase();
-    const gradoLower = (grado || '').toLowerCase();
-    const materiaLower = (materia || '').toLowerCase();
+    const queryLower = normalizeSearchText(query);
+    const gradoLower = normalizeSearchText(grado);
+    const materiaLower = normalizeSearchText(materia);
 
     // Estructura de curatedResources.json:
     // { "<materia>": [ { titulo, url, tipo, grados:[], temas:[], descripcion } ] }
     const candidatos = [];
     for (const [keyMat, lista] of Object.entries(pool)) {
         if (!Array.isArray(lista)) continue;
-        const materiaMatch = materiaLower && keyMat.toLowerCase().includes(materiaLower);
+        const keyMatNorm = normalizeSearchText(keyMat);
+        const materiaMatch = materiaLower && (keyMatNorm.includes(materiaLower) || materiaLower.includes(keyMatNorm));
         for (const r of lista) {
-            const temasMatch = (r.temas || []).some(t => queryLower.includes(t.toLowerCase()) || t.toLowerCase().includes(queryLower));
-            const gradoMatch = !gradoLower || (r.grados || []).some(g => gradoLower.includes(g.toLowerCase()) || g.toLowerCase().includes(gradoLower));
+            if (esFuenteProhibida(r.url || '')) continue;
+            const temasMatch = (r.temas || []).some(t => {
+                const temaNorm = normalizeSearchText(t);
+                return queryLower.includes(temaNorm) || temaNorm.includes(queryLower);
+            });
+            const gradoMatch = !gradoLower || (r.grados || []).some(g => {
+                const gradoNorm = normalizeSearchText(g);
+                return gradoLower.includes(gradoNorm) || gradoNorm.includes(gradoLower);
+            });
             if ((materiaMatch || temasMatch) && gradoMatch) {
                 candidatos.push({ ...r, score: r.score || 75, fuenteOrigen: 'curado' });
             }
@@ -203,7 +361,7 @@ export async function fallbackPoolCurado(query = '', grado = '', materia = '') {
     // Si nada matchea, devolver primeros 3 del pool default
     if (candidatos.length === 0) {
         const def = pool.default || [];
-        return def.slice(0, 3).map(r => ({ ...r, score: r.score || 70, fuenteOrigen: 'curado' }));
+        return def.filter(r => !esFuenteProhibida(r.url || '')).slice(0, 3).map(r => ({ ...r, score: r.score || 70, fuenteOrigen: 'curado' }));
     }
     return candidatos.slice(0, 6);
 }
@@ -219,9 +377,12 @@ export async function obtenerRecursosConCascada({ tema, grado = '', materia = ''
 
     let resultados = [...yaTeniamos];
 
-    // Si Plan A ya tiene suficiente, devolvemos directo
-    if (resultados.length >= 4) {
-        return dedupAndRank(resultados);
+    // Si Plan A ya tiene suficiente y además sirve para crear tarea, devolvemos directo.
+    // Videos solos no bastan: el maestro necesita al menos una fuente procesable.
+    if (resultados.length >= 4 && tieneFuentesParaTarea(resultados) && tienePdf(resultados)) {
+        const ranked = dedupAndRank(resultados);
+        recordCascade(ranked);
+        return ranked;
     }
 
     // Disparar Plan B en paralelo
@@ -232,13 +393,16 @@ export async function obtenerRecursosConCascada({ tema, grado = '', materia = ''
     if (yt.status === 'fulfilled') resultados = resultados.concat(yt.value);
     if (cse.status === 'fulfilled') resultados = resultados.concat(cse.value);
 
-    // Si aún no llegamos a 3, traemos pool curado
-    if (resultados.length < 3) {
+    // Si aún no llegamos a 3, o sólo tenemos videos/artículos sin PDF, traemos pool curado.
+    // Esto evita que YouTube "llene" la búsqueda y deje vacía la sección usable para tareas.
+    if (resultados.length < 3 || !tieneFuentesParaTarea(resultados) || !tienePdf(resultados)) {
         const curado = await fallbackPoolCurado(tema, grado, materia);
         resultados = resultados.concat(curado);
     }
 
-    return dedupAndRank(resultados);
+    const ranked = dedupAndRank(resultados);
+    recordCascade(ranked);
+    return ranked;
 }
 
 function dedupAndRank(lista) {
@@ -265,6 +429,9 @@ export function getFallbackTelemetry() {
         config: {
             youtubeKeySet: !!YOUTUBE_KEY,
             googleCSESet: !!(GOOGLE_CSE_KEY && GOOGLE_CSE_ID)
-        }
+        },
+        youtube: cloneJSON(providerDiagnostics.youtube),
+        googleCSE: cloneJSON(providerDiagnostics.googleCSE),
+        lastCascade: cloneJSON(lastCascade)
     };
 }

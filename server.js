@@ -2363,7 +2363,10 @@ app.get('/api/admin/health/ia', (req, res) => {
                 ai.gemini.calls === 0 && !ai.config.geminiKeySet ? 'Configura GEMINI_API_KEY' : null,
                 ai.gemini.calls > 0 && ai.gemini.successRate !== null && ai.gemini.successRate < 0.5 ? 'Tasa de éxito Gemini < 50% — revisa API key o cuota' : null,
                 !fb.config.youtubeKeySet ? 'Configura YOUTUBE_API_KEY para fallback de videos' : null,
-                !fb.config.googleCSESet ? 'Configura GOOGLE_CSE_ID + GOOGLE_CSE_KEY para fallback de PDFs académicos' : null,
+                fb.youtube?.probableCause && fb.youtube.probableCause !== 'not_configured'
+                    ? `YouTube fallback: ${fb.youtube.probableCause} (${fb.youtube.lastStatus || 'sin status'})` : null,
+                fb.googleCSE?.probableCause && fb.googleCSE.probableCause !== 'not_configured'
+                    ? `Google CSE opcional: ${fb.googleCSE.probableCause} (${fb.googleCSE.lastStatus || 'sin status'})` : null,
                 ai.schemaFails > 5 ? `${ai.schemaFails} respuestas con JSON inválido — considera subir el modelo` : null
             ].filter(Boolean)
         });
@@ -2852,7 +2855,8 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         // Plan A — Gemini grounding
         let recursosIA = [];
         if (GEMINI_KEY) {
-            const recursos = await buscarRecursosEducativosIA(tema);
+            const temaBusquedaIA = [tema, materia || '', grado || ''].filter(Boolean).join(' · ');
+            const recursos = await buscarRecursosEducativosIA(temaBusquedaIA);
             if (recursos) {
                 (recursos.articulos || []).forEach(a => {
                     if (!a.url) return;
@@ -2878,6 +2882,7 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
 
         // Plan B + C via cascada (sólo si A devolvió poco)
         const todos = await obtenerRecursosConCascada({ tema, grado: grado || '', materia: materia || '', recursosIA });
+        const fuentesUsadas = [...new Set(todos.map(r => r.fuenteOrigen || 'desconocido'))];
 
         // Reformatear al shape del frontend
         const paraTarea = [];
@@ -2900,6 +2905,29 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
 
         const total = paraTarea.length + materialExtra.length;
         const lowConfidence = total < 3;
+        const fallbackTelemetry = getFallbackTelemetry();
+        const fuenteIA = total > 0
+            ? (fuentesUsadas.length === 1 && fuentesUsadas[0] === 'gemini' ? 'google_search' : 'cascada')
+            : 'verificada_sin_resultados';
+        const fallbackResumen = {
+            fuentesUsadas,
+            poolCuradoUsado: fuentesUsadas.includes('curado'),
+            taskReadyCount: fallbackTelemetry.lastCascade?.taskReadyCount ?? paraTarea.length,
+            pdfCount: fallbackTelemetry.lastCascade?.pdfCount ?? paraTarea.filter(r => r.tipo === 'PDF' || esPdfUrl(r.url || '')).length,
+            youtube: {
+                configured: !!fallbackTelemetry.youtube?.configured,
+                lastStatus: fallbackTelemetry.youtube?.lastStatus ?? null,
+                lastError: fallbackTelemetry.youtube?.lastError ?? null,
+                probableCause: fallbackTelemetry.youtube?.probableCause ?? null
+            },
+            googleCSE: {
+                configured: !!fallbackTelemetry.googleCSE?.configured,
+                optional: true,
+                lastStatus: fallbackTelemetry.googleCSE?.lastStatus ?? null,
+                lastError: fallbackTelemetry.googleCSE?.lastError ?? null,
+                probableCause: fallbackTelemetry.googleCSE?.probableCause ?? null
+            }
+        };
 
         res.json({
             recursos: [...paraTarea, ...materialExtra],
@@ -2913,7 +2941,8 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
                 `${tema} site:unam.mx filetype:pdf`,
                 `${tema} site:scielo.org.mx OR site:redalyc.org`
             ],
-            fuenteIA: total > 0 ? 'cascada' : 'verificada_sin_resultados',
+            fuenteIA,
+            fallbackResumen,
             low_confidence: lowConfidence
         });
     } catch (e) {
