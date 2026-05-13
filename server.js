@@ -42,8 +42,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = 'Beta 2.0.0.6';
-const PACKAGE_VERSION = '2.0.0-beta.6';
+const APP_VERSION = 'Beta 3.0.0';
+const PACKAGE_VERSION = '3.0.0-beta.0';
 
 if (!process.env.JWT_SECRET) {
     console.error("❌ FALTA JWT_SECRET en variables de entorno. El servidor no puede iniciar sin un secreto.");
@@ -288,12 +288,31 @@ app.get('/api/health', (req, res) => {
 
 // ── Catálogos hardcodeados
 const SEMESTRES = ['1er Semestre','2do Semestre','3er Semestre','4to Semestre','5to Semestre','6to Semestre'];
+const NIVELES_REFERENCIA = ['Secundaria', 'Preparatoria', 'Universidad'];
 const MATERIAS = [
     'Español','Matemáticas','Historia Universal','Historia de México',
     'Geografía','Biología','Química','Física','Inglés',
     'Filosofía','Ética y Valores','Informática','Educación Física',
     'Administración','Contabilidad','Economía','Arte y Cultura'
 ];
+
+function normalizarNivelReferencia(value) {
+    const norm = String(value || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+    if (norm.includes('secundaria')) return 'Secundaria';
+    if (norm.includes('universidad') || norm.includes('licenciatura') || norm.includes('superior')) return 'Universidad';
+    if (norm.includes('prepa') || norm.includes('bachillerato') || norm.includes('semestre')) return 'Preparatoria';
+    return '';
+}
+
+function complejidadPorNivel(value) {
+    const nivel = normalizarNivelReferencia(value);
+    if (nivel === 'Secundaria') return 'introductorio';
+    if (nivel === 'Universidad') return 'avanzado';
+    return 'intermedio';
+}
 
 // ── Esquemas MongoDB
 
@@ -705,6 +724,36 @@ app.post('/api/admin/director', verifyAdmin, async (req, res) => {
         const passwordHash = await bcrypt.hash(password, 10);
         const director = await Director.create({ nombre, email: email.toLowerCase(), passwordHash, escuelaId });
         res.json({ director: { _id: director._id, nombre: director.nombre, email: director.email, escuelaId } });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/director/:directorId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const { nombre, email, escuelaId } = req.body || {};
+        const update = {};
+        if (nombre !== undefined) update.nombre = String(nombre).trim();
+        if (email !== undefined) {
+            const nextEmail = String(email).trim().toLowerCase();
+            if (!nextEmail) return res.status(400).json({ error: 'Email inválido.' });
+            const existe = await Director.findOne({ email: nextEmail, _id: { $ne: req.params.directorId } });
+            if (existe) return res.status(409).json({ error: 'Ya existe un director con ese email.' });
+            update.email = nextEmail;
+        }
+        if (escuelaId !== undefined) update.escuelaId = escuelaId || ESCUELA_DEFAULT_ID;
+        if (!Object.keys(update).length) return res.status(400).json({ error: 'No hay cambios.' });
+        const director = await Director.findByIdAndUpdate(req.params.directorId, update, { new: true }).select('-passwordHash -resetToken -resetTokenExp');
+        if (!director) return res.status(404).json({ error: 'Director no encontrado.' });
+        res.json({ director });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/director/:directorId', verifyAdmin, async (req, res) => {
+    try {
+        if (!mongoose.connection.readyState) return res.status(503).json({ error: 'BD no disponible.' });
+        const deleted = await Director.findByIdAndDelete(req.params.directorId).select('_id');
+        if (!deleted) return res.status(404).json({ error: 'Director no encontrado.' });
+        res.json({ ok: true });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1722,9 +1771,10 @@ async function buscarRecursosEducativosIA(tema, intento = 1) {
 `${queryHint}
 
 FUENTES OBLIGATORIAS (usa google_search):
-1. PDFs académicos gratuitos o guías oficiales, preferentemente de gob.mx, sep.gob.mx, unam.mx, ipn.mx, conacyt.mx/conahcyt.mx, uam.mx, colmex.mx, scielo.org.mx, redalyc.org o repositorios universitarios.
-2. Artículos finales de instituciones, universidades, organismos públicos o repositorios académicos. Deben ser páginas finales, no buscadores.
-3. Videos de YouTube solo si son URLs finales de video de canales educativos o institucionales verificables (UNAM, IPN, SEP, TED-Ed en español, Math2Me, DW Documental, BBC Mundo, Veritasium en español, QuantumFracture, Derivando).
+1. PDFs directos primero: académicos gratuitos, guías oficiales o material docente. La URL debe terminar en .pdf antes de parámetros o fragmentos.
+2. Prioriza PDFs de gob.mx, sep.gob.mx, conaliteg, unam.mx, ipn.mx, uam.mx, colmex.mx, scielo.org.mx, redalyc.org, repositorios universitarios, NASA/NOAA/NIH, OpenStax o instituciones oficiales.
+3. Videos educativos opcionales: máximo 2, sólo URLs finales https://www.youtube.com/watch?v=ID o https://youtu.be/ID, útiles como apoyo visual por nivel.
+4. NO devuelvas páginas HTML aunque sean confiables. NO devuelvas landing pages, catálogos, buscadores internos, páginas de descarga ni artículos web.
 
 REGLAS ABSOLUTAS:
 • PROHIBIDO Wikipedia y Wikimedia (en cualquier idioma). NO los incluyas.
@@ -1736,10 +1786,10 @@ REGLAS ABSOLUTAS:
 • No incluyas URLs con parámetros de tracking (?utm_, ?si=, ?feature=).
 • Si dudas de una URL, omítela. Es mejor un array pequeño y correcto que uno grande con enlaces rotos.
 • Si no encuentras fuentes finales buenas, devuelve arrays vacíos. NO rellenes con Wikipedia, Khan, Google Scholar ni buscadores.
-• Devuelve máximo 2 videos y máximo 4 artículos/PDFs.
+• Devuelve máximo 6 PDFs directos y máximo 2 videos educativos opcionales. Si no encuentras PDFs directos, devuelve arrays vacíos en articulos.
 
 Responde SOLO con este JSON exacto:
-{"videos":[{"titulo":"...","url":"https://youtube.com/watch?v=XXXXXXXXXXX","canal":"...","descripcion":"...","duracion":"..."}],"articulos":[{"titulo":"...","url":"https://...","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["...","...","..."]}`
+{"videos":[{"titulo":"...","url":"https://www.youtube.com/watch?v=ID","fuente":"Canal educativo","descripcion":"..."}],"articulos":[{"titulo":"...","url":"https://...archivo.pdf","fuente":"...","descripcion":"..."}],"consultas_sugeridas":["... filetype:pdf","... filetype:pdf","... video educativo"]}`
             }] }],
             tools: [{ google_search: {} }],
             generationConfig: { temperature: 0.05, maxOutputTokens: 2048, responseMimeType: "application/json" }
@@ -1784,16 +1834,20 @@ Responde SOLO con este JSON exacto:
                 } catch {}
                 return false;
             };
-            const trustedOrCited = (url) => isCited(url) || esDominioEducativo(url) || esPdfUrl(url);
-            data.videos    = (data.videos || []).filter(v => isCited(v.url)); // videos sí estrictos
-            data.articulos = (data.articulos || []).filter(a => trustedOrCited(a.url));
+            const trustedOrCitedPdf = (url) => esPdfUrl(url) && (isCited(url) || esDominioEducativo(url));
+            data.videos = (data.videos || [])
+                .filter(v => v?.url && esYoutubeVideoUrl(v.url) && isCited(v.url))
+                .slice(0, 2);
+            data.articulos = (data.articulos || []).filter(a => trustedOrCitedPdf(a.url));
         }
 
         // 2) Filtrar fuentes prohibidas + verificar oEmbed YouTube + diversidad dominios
         data = await filtrarYverificarRecursos(data);
+        data.videos = (data.videos || []).slice(0, 2);
+        data.articulos = (data.articulos || []).filter(a => a?.url && esPdfUrl(a.url));
 
         const totalVerificados = (data.videos?.length || 0) + (data.articulos?.length || 0);
-        console.log(`✅ Recursos verificados [intento ${intento}]: ${data.videos?.length || 0} videos + ${data.articulos?.length || 0} artículos (cita-grounded: ${urlsConfiables.size > 0})`);
+        console.log(`✅ Recursos verificados [intento ${intento}]: ${data.articulos?.length || 0} PDFs directos + ${data.videos?.length || 0} videos (cita-grounded: ${urlsConfiables.size > 0})`);
 
         // Si tras todo siguen siendo pocos recursos, agregar nota de tema con poca documentación
         const totalFinal = (data.videos?.length || 0) + (data.articulos?.length || 0);
@@ -2136,7 +2190,7 @@ ${sourceText.substring(0, 30000)}`
 
 // Catálogos para el frontend
 app.get('/api/catalogos', (req, res) => {
-    res.json({ semestres: SEMESTRES, materias: MATERIAS });
+    res.json({ semestres: SEMESTRES, materias: MATERIAS, nivelesReferencia: NIVELES_REFERENCIA });
 });
 
 // Listar grupos (para el desplegable del alumno)
@@ -2849,13 +2903,14 @@ app.get('/api/maestro/analytics/:grupoId', verifyToken, async (req, res) => {
 //   Garantiza nunca devolver vacío. Fix Bug 3.
 app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
     try {
-        const { tema, grado, materia } = req.body;
+        const { tema, grado, materia, nivelReferencia } = req.body;
         if (!tema || tema.length < 3) return res.status(400).json({ error: 'Escribe un tema para buscar.' });
+        const nivelEfectivo = normalizarNivelReferencia(nivelReferencia || grado) || 'Preparatoria';
 
         // Plan A — Gemini grounding
         let recursosIA = [];
         if (GEMINI_KEY) {
-            const temaBusquedaIA = [tema, materia || '', grado || ''].filter(Boolean).join(' · ');
+            const temaBusquedaIA = [tema, materia || '', nivelEfectivo].filter(Boolean).join(' · ');
             const recursos = await buscarRecursosEducativosIA(temaBusquedaIA);
             if (recursos) {
                 (recursos.articulos || []).forEach(a => {
@@ -2881,7 +2936,7 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         }
 
         // Plan B + C via cascada (sólo si A devolvió poco)
-        const todos = await obtenerRecursosConCascada({ tema, grado: grado || '', materia: materia || '', recursosIA });
+        const todos = await obtenerRecursosConCascada({ tema, grado: nivelEfectivo, materia: materia || '', nivelReferencia: nivelEfectivo, recursosIA });
         const fuentesUsadas = [...new Set(todos.map(r => r.fuenteOrigen || 'desconocido'))];
 
         // Reformatear al shape del frontend
@@ -2889,12 +2944,14 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         const materialExtra = [];
         for (const r of todos) {
             const esVideo = r.esVideo || !!r.youtubeId || r.tipo === 'Video';
+            const complejidad = r.complejidad || complejidadPorNivel(nivelEfectivo);
             const item = {
                 titulo: r.titulo, fuente: r.fuente || r.canal || dominioBase(r.url || ''),
                 tipo: r.tipo || (esVideo ? 'Video' : 'Artículo'),
-                nivel: 'Preparatoria', descripcion: r.descripcion || '',
+                nivel: nivelEfectivo, descripcion: r.descripcion || '',
                 url: r.url, idioma: 'Español', procesable: !esVideo,
                 esVideo, urlActiva: true,
+                complejidad,
                 score: r.score || 50,
                 fuenteOrigen: r.fuenteOrigen || 'desconocido',
                 ...(esVideo && (r.youtubeId || r.videoId) ? { videoId: r.youtubeId || r.videoId } : {}),
@@ -2904,7 +2961,9 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         }
 
         const total = paraTarea.length + materialExtra.length;
-        const lowConfidence = total < 3;
+        const pdfsEncontrados = paraTarea.filter(r => r.tipo === 'PDF' || esPdfUrl(r.url || '')).length;
+        const videosEncontrados = materialExtra.length;
+        const lowConfidence = pdfsEncontrados < 2 || total < 3;
         const fallbackTelemetry = getFallbackTelemetry();
         const fuenteIA = total > 0
             ? (fuentesUsadas.length === 1 && fuentesUsadas[0] === 'gemini' ? 'google_search' : 'cascada')
@@ -2912,8 +2971,10 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
         const fallbackResumen = {
             fuentesUsadas,
             poolCuradoUsado: fuentesUsadas.includes('curado'),
+            nivelReferencia: nivelEfectivo,
             taskReadyCount: fallbackTelemetry.lastCascade?.taskReadyCount ?? paraTarea.length,
             pdfCount: fallbackTelemetry.lastCascade?.pdfCount ?? paraTarea.filter(r => r.tipo === 'PDF' || esPdfUrl(r.url || '')).length,
+            videoCount: fallbackTelemetry.lastCascade?.videoCount ?? materialExtra.length,
             youtube: {
                 configured: !!fallbackTelemetry.youtube?.configured,
                 lastStatus: fallbackTelemetry.youtube?.lastStatus ?? null,
@@ -2934,12 +2995,12 @@ app.post('/api/maestro/recursos', verifyToken, async (req, res) => {
             paraTarea,
             materialExtra,
             consejo: total > 0
-                ? `Encontramos ${total} recursos para "${tema}".${lowConfidence ? ' Pocos resultados — intenta un tema más específico.' : ''}`
+                ? `Encontramos ${pdfsEncontrados} PDFs directos y ${videosEncontrados} videos para "${tema}".${lowConfidence ? ' Pocos resultados — intenta un tema más específico.' : ''}`
                 : `No se encontraron recursos para "${tema}". Sugerencia: usa términos más comunes o sube tu propio PDF.`,
             consultasSugeridas: [
-                `${tema} site:gob.mx filetype:pdf`,
-                `${tema} site:unam.mx filetype:pdf`,
-                `${tema} site:scielo.org.mx OR site:redalyc.org`
+                `${tema} ${nivelEfectivo} site:gob.mx filetype:pdf`,
+                `${tema} ${nivelEfectivo} site:unam.mx filetype:pdf`,
+                `${tema} ${nivelEfectivo} site:scielo.org.mx OR site:redalyc.org`
             ],
             fuenteIA,
             fallbackResumen,

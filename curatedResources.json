@@ -1,12 +1,30 @@
 {
   "matematicas": [
     {
-      "titulo": "Matemáticas — OpenStax (libros gratuitos)",
-      "url": "https://openstax.org/subjects/math",
-      "tipo": "Articulo",
+      "titulo": "OpenStax — College Algebra",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/CollegeAlgebra-OP.pdf",
+      "tipo": "PDF",
       "grados": ["secundaria", "preparatoria", "bachillerato"],
       "temas": ["álgebra", "ecuaciones", "ecuaciones cuadráticas", "funciones cuadráticas", "cálculo", "trigonometría", "estadística", "geometría", "precálculo"],
-      "descripcion": "Libros de texto abiertos revisados por pares de OpenStax (Rice University). Cubre desde álgebra básica hasta cálculo multivariable.",
+      "descripcion": "PDF directo de OpenStax/Rice University para álgebra, funciones, ecuaciones y modelos matemáticos.",
+      "score": 95
+    },
+    {
+      "titulo": "OpenStax — Calculus Volume 1",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/CalculusVolume1-OP.pdf",
+      "tipo": "PDF",
+      "grados": ["universidad"],
+      "temas": ["cálculo", "calculo", "cálculo diferencial", "derivadas", "límites", "integrales"],
+      "descripcion": "Libro universitario gratuito revisado por pares con límites, derivadas, integrales y aplicaciones.",
+      "score": 96
+    },
+    {
+      "titulo": "OpenStax — Algebra and Trigonometry 2e",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/AlgebraAndTrigonometry-OP_1tE6R5r.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "bachillerato", "universidad"],
+      "temas": ["álgebra", "algebra", "trigonometría", "funciones", "ecuaciones", "precálculo"],
+      "descripcion": "Libro gratuito con álgebra, funciones y trigonometría para cursos puente hacia universidad.",
       "score": 95
     },
     {
@@ -49,22 +67,22 @@
   ],
   "fisica": [
     {
-      "titulo": "OpenStax — Física Universitaria",
-      "url": "https://openstax.org/subjects/science",
+      "titulo": "NASA — X-57 Maxwell Educator Guide",
+      "url": "https://www.nasa.gov/wp-content/uploads/2018/07/x-57-maxwell-educator-guide.pdf",
       "tipo": "PDF",
       "grados": ["preparatoria", "bachillerato", "universidad"],
-      "temas": ["mecánica", "termodinámica", "ondas", "electromagnetismo", "óptica", "física moderna"],
-      "descripcion": "Libro de texto gratuito de física universitaria con ejercicios resueltos.",
+      "temas": ["mecánica", "termodinámica", "ondas", "electromagnetismo", "óptica", "física moderna", "energía", "aerodinámica", "fuerzas"],
+      "descripcion": "PDF oficial de NASA con actividades de física, energía, aerodinámica e ingeniería alrededor del avión eléctrico X-57.",
       "score": 95
     },
     {
-      "titulo": "NASA — Recursos Educativos",
-      "url": "https://www.nasa.gov/learning-resources/for-educators/",
-      "tipo": "Articulo",
+      "titulo": "NASA — FlyBy Math Educator Guide",
+      "url": "https://www.nasa.gov/wp-content/uploads/2023/02/educator-guide-fbm-1.pdf",
+      "tipo": "PDF",
       "grados": ["primaria", "secundaria", "preparatoria"],
-      "temas": ["astronomía", "espacio", "física", "ciencia planetaria"],
-      "descripcion": "Materiales educativos oficiales de NASA: lecciones, simulaciones, datos reales de misiones espaciales.",
-      "score": 95
+      "temas": ["astronomía", "espacio", "física", "ciencia planetaria", "matemáticas", "velocidad", "medición"],
+      "descripcion": "PDF oficial de NASA para aplicar medición, velocidad, rutas y razonamiento matemático con contexto aeroespacial.",
+      "score": 92
     },
     {
       "titulo": "Khan Academy — Física",
@@ -80,10 +98,10 @@
     {
       "titulo": "OpenStax — Química",
       "url": "https://openstax.org/details/books/chemistry-2e",
-      "tipo": "PDF",
-      "grados": ["preparatoria", "bachillerato"],
+      "tipo": "Articulo",
+      "grados": ["preparatoria", "bachillerato", "universidad"],
       "temas": ["átomos", "enlaces", "estequiometría", "termodinámica", "ácidos y bases", "química orgánica"],
-      "descripcion": "Libro de química general gratuito con ejercicios resueltos.",
+      "descripcion": "Página oficial del libro de química general; el modo PDF-only sólo la usa si CSE/Gemini encuentran PDF directo.",
       "score": 95
     },
     {
@@ -99,9 +117,9 @@
   "biologia": [
     {
       "titulo": "OpenStax — Biología 2e",
-      "url": "https://openstax.org/details/books/biology-2e",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/Biology2e-WEB.pdf",
       "tipo": "PDF",
-      "grados": ["preparatoria", "bachillerato"],
+      "grados": ["secundaria", "preparatoria", "bachillerato", "universidad"],
       "temas": ["célula", "genética", "evolución", "ecología", "fisiología", "fotosíntesis", "mitosis"],
       "descripcion": "Libro de biología general gratuito alineado con currículo de bachillerato.",
       "score": 95
@@ -137,7 +155,7 @@
   "historia": [
     {
       "titulo": "INEHRM — Instituto Nacional de Estudios Históricos",
-      "url": "https://www.inehrm.gob.mx/es/inehrm/Publicaciones",
+      "url": "https://www.inehrm.gob.mx/work/models/inehrm/Resource/6831/5_Revolucion_Mexicana.pdf",
       "tipo": "PDF",
       "grados": ["secundaria", "preparatoria"],
       "temas": ["historia de méxico", "revolución mexicana", "independencia", "porfiriato", "siglo xx"],
@@ -225,30 +243,39 @@
   ],
   "default": [
     {
-      "titulo": "Khan Academy — Inicio",
-      "url": "https://es.khanacademy.org/",
-      "tipo": "Articulo",
-      "grados": ["primaria", "secundaria", "preparatoria"],
-      "temas": ["matemáticas", "ciencias", "programación", "humanidades"],
-      "descripcion": "Plataforma educativa gratuita con cursos en todas las materias en español.",
-      "score": 80
+      "titulo": "OpenStax — College Algebra",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/CollegeAlgebra-OP.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "universidad"],
+      "temas": ["matemáticas", "álgebra", "ecuaciones", "funciones"],
+      "descripcion": "PDF directo de OpenStax/Rice University con contenido base de álgebra para tareas.",
+      "score": 92
     },
     {
-      "titulo": "OpenStax — Libros de texto gratuitos",
-      "url": "https://openstax.org/subjects",
-      "tipo": "Articulo",
-      "grados": ["preparatoria", "universidad"],
-      "temas": ["ciencias", "humanidades", "negocios", "matemáticas"],
-      "descripcion": "Libros de texto universitarios gratuitos revisados por pares.",
+      "titulo": "OpenStax — Concepts of Biology",
+      "url": "https://assets.openstax.org/oscms-prodcms/media/documents/ConceptsofBiology-WEB.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "universidad"],
+      "temas": ["ciencias", "biología", "célula", "ecosistemas", "genética"],
+      "descripcion": "PDF directo de OpenStax/Rice University para biología general y ciencias.",
+      "score": 92
+    },
+    {
+      "titulo": "NASA — X-57 Maxwell Educator Guide",
+      "url": "https://www.nasa.gov/wp-content/uploads/2018/07/x-57-maxwell-educator-guide.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "universidad"],
+      "temas": ["ciencias", "física", "energía", "ingeniería", "aerodinámica"],
+      "descripcion": "PDF oficial de NASA con actividades STEM listas para clase.",
       "score": 90
     },
     {
-      "titulo": "MIT OpenCourseWare",
-      "url": "https://ocw.mit.edu/",
-      "tipo": "Articulo",
-      "grados": ["preparatoria", "universidad"],
-      "temas": ["ciencias", "ingeniería", "humanidades"],
-      "descripcion": "Cursos completos del MIT disponibles gratuitamente.",
+      "titulo": "INEHRM — Revolución Mexicana",
+      "url": "https://www.inehrm.gob.mx/work/models/inehrm/Resource/6831/5_Revolucion_Mexicana.pdf",
+      "tipo": "PDF",
+      "grados": ["secundaria", "preparatoria", "universidad"],
+      "temas": ["historia", "revolución mexicana", "méxico", "siglo xx"],
+      "descripcion": "PDF oficial del INEHRM sobre Revolución Mexicana.",
       "score": 90
     }
   ]
